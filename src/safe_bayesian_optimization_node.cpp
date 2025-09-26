@@ -124,6 +124,8 @@ public:
 
     // No goal received yet
     goal_received_ = false;
+    last_subgoal_position_.setZero();
+    has_last_subgoal_ = false;
 
     RCLCPP_INFO(this->get_logger(), "Optimizer Node Initialized");
   }
@@ -173,6 +175,10 @@ private:
   // Current goal point
   geometry_msgs::msg::PointStamped current_goal_;
   bool goal_received_;
+
+  // Track the last published subgoal to limit aggressive jumps
+  Eigen::Vector2d last_subgoal_position_;
+  bool has_last_subgoal_;
 
   // Store eroded concave polygon for subgoal projection
   bg::model::polygon<bg::model::d2::point_xy<double>> eroded_concave_polygon_;
@@ -513,22 +519,51 @@ private:
     const size_t num_frontiers = frontier_indices.size();
     Eigen::MatrixXd frontier_points(num_frontiers, 2);
     Eigen::VectorXd frontier_confidence_width(num_frontiers);
+    Eigen::VectorXd frontier_prev_distance =
+        Eigen::VectorXd::Zero(num_frontiers);
+
+    const Eigen::RowVector2d prev_subgoal_row =
+        last_subgoal_position_.transpose();
 
     for (size_t i = 0; i < num_frontiers; ++i) {
       const int idx = frontier_indices[i];
       frontier_points.row(i) = D_.row(idx);
       frontier_confidence_width(i) = Q_(idx, 1) - Q_(idx, 0);
+      if (has_last_subgoal_) {
+        frontier_prev_distance(i) =
+            (frontier_points.row(i) - prev_subgoal_row).norm();
+      }
     }
 
     if (!goal_received_) {
-      double best_confidence_width = -1.0;
+      const double max_confidence =
+          frontier_confidence_width.size() > 0
+              ? frontier_confidence_width.maxCoeff()
+              : 0.0;
+      const double prev_scale =
+          (has_last_subgoal_ && frontier_prev_distance.size() > 0)
+              ? std::max(1e-3, frontier_prev_distance.maxCoeff())
+              : 1.0;
+
+      double best_score = -1.0;
       int best_index = -1;
 
       for (size_t i = 0; i < num_frontiers; ++i) {
-        double conf_width = frontier_confidence_width(i);
+        const double conf_score =
+            (max_confidence > 1e-6)
+                ? frontier_confidence_width(i) / max_confidence
+                : 1.0;
+        double prev_score = 1.0;
+        if (has_last_subgoal_) {
+          const double normalized_distance =
+              frontier_prev_distance(i) / prev_scale;
+          prev_score = 1.0 / (1.0 + normalized_distance);
+        }
 
-        if (conf_width > best_confidence_width) {
-          best_confidence_width = conf_width;
+        const double score = conf_score * prev_score;
+
+        if (score > best_score) {
+          best_score = score;
           best_index = static_cast<int>(i);
         }
       }
@@ -558,16 +593,52 @@ private:
     // Take top 25% of closest points
     size_t top_quarter_size = std::max(size_t(1), distance_pairs.size() / 4);
 
-    // Find the point with best confidence width among the closest points
-    double best_confidence_width = -1.0;
+    // Combine confidence, goal proximity, and previous subgoal proximity
+    double max_confidence = 0.0;
+    double max_goal_distance = 0.0;
+    double max_prev_distance = 0.0;
+
+    for (size_t i = 0; i < top_quarter_size; ++i) {
+      const size_t frontier_idx = distance_pairs[i].second;
+      max_confidence = std::max(max_confidence,
+                                frontier_confidence_width(frontier_idx));
+      max_goal_distance =
+          std::max(max_goal_distance, distances(frontier_idx));
+      if (has_last_subgoal_) {
+        max_prev_distance = std::max(max_prev_distance,
+                                     frontier_prev_distance(frontier_idx));
+      }
+    }
+
+    const double conf_scale = std::max(1e-6, max_confidence);
+    const double goal_scale = std::max(1e-3, max_goal_distance);
+    const double prev_scale =
+        has_last_subgoal_ ? std::max(1e-3, max_prev_distance) : 1.0;
+
+    double best_score = -1.0;
     int best_index = -1;
 
     for (size_t i = 0; i < top_quarter_size; ++i) {
-      size_t frontier_idx = distance_pairs[i].second;
-      double conf_width = frontier_confidence_width(frontier_idx);
+      const size_t frontier_idx = distance_pairs[i].second;
 
-      if (conf_width > best_confidence_width) {
-        best_confidence_width = conf_width;
+      const double conf_score =
+          (max_confidence > 1e-6)
+              ? frontier_confidence_width(frontier_idx) / conf_scale
+              : 1.0;
+      const double goal_score = 1.0 /
+                                (1.0 + distances(frontier_idx) / goal_scale);
+
+      double prev_score = 1.0;
+      if (has_last_subgoal_) {
+        const double normalized_distance =
+            frontier_prev_distance(frontier_idx) / prev_scale;
+        prev_score = 1.0 / (1.0 + normalized_distance);
+      }
+
+      const double score = conf_score * goal_score * prev_score;
+
+      if (score > best_score) {
+        best_score = score;
         best_index = static_cast<int>(frontier_idx);
       }
     }
@@ -753,6 +824,9 @@ private:
         return;
       }
     }
+
+    last_subgoal_position_ << subgoal.x, subgoal.y;
+    has_last_subgoal_ = true;
 
     current_subgoal_pub_->publish(subgoal);
 
