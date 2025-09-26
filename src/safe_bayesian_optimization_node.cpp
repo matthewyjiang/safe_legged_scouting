@@ -122,6 +122,9 @@ public:
     // Initialize last spatial data size
     last_spatial_data_size_ = 0;
 
+    // No goal received yet
+    goal_received_ = false;
+
     RCLCPP_INFO(this->get_logger(), "Optimizer Node Initialized");
   }
 
@@ -169,6 +172,7 @@ private:
 
   // Current goal point
   geometry_msgs::msg::PointStamped current_goal_;
+  bool goal_received_;
 
   // Store eroded concave polygon for subgoal projection
   bg::model::polygon<bg::model::d2::point_xy<double>> eroded_concave_polygon_;
@@ -516,6 +520,28 @@ private:
       frontier_confidence_width(i) = Q_(idx, 1) - Q_(idx, 0);
     }
 
+    if (!goal_received_) {
+      double best_confidence_width = -1.0;
+      int best_index = -1;
+
+      for (size_t i = 0; i < num_frontiers; ++i) {
+        double conf_width = frontier_confidence_width(i);
+
+        if (conf_width > best_confidence_width) {
+          best_confidence_width = conf_width;
+          best_index = static_cast<int>(i);
+        }
+      }
+
+      if (best_index < 0) {
+        RCLCPP_WARN(this->get_logger(),
+                    "Failed to select frontier point by uncertainty");
+        return -1;
+      }
+
+      return frontier_indices[best_index];
+    }
+
     const Eigen::VectorXd goal_eigen =
         (Eigen::VectorXd(2) << current_goal_.point.x, current_goal_.point.y)
             .finished();
@@ -531,19 +557,25 @@ private:
 
     // Take top 25% of closest points
     size_t top_quarter_size = std::max(size_t(1), distance_pairs.size() / 4);
-    
+
     // Find the point with best confidence width among the closest points
     double best_confidence_width = -1.0;
     int best_index = -1;
-    
+
     for (size_t i = 0; i < top_quarter_size; ++i) {
       size_t frontier_idx = distance_pairs[i].second;
       double conf_width = frontier_confidence_width(frontier_idx);
-      
+
       if (conf_width > best_confidence_width) {
         best_confidence_width = conf_width;
-        best_index = frontier_idx;
+        best_index = static_cast<int>(frontier_idx);
       }
+    }
+
+    if (best_index < 0) {
+      RCLCPP_WARN(this->get_logger(),
+                  "Failed to select frontier point near goal");
+      return -1;
     }
 
     return frontier_indices[best_index];
@@ -654,7 +686,7 @@ private:
                                                current_goal_.point.y);
 
     geometry_msgs::msg::Point subgoal;
-    if (bg::within(goal_point, eroded_concave_polygon_)) {
+    if (goal_received_ && bg::within(goal_point, eroded_concave_polygon_)) {
       // Goal is safe, use it directly as the subgoal
       subgoal.x = current_goal_.point.x;
       subgoal.y = current_goal_.point.y;
@@ -665,6 +697,10 @@ private:
           "Goal is within eroded safe region, using goal as subgoal: (%f, %f)",
           subgoal.x, subgoal.y);
     } else {
+      if (!goal_received_) {
+        RCLCPP_INFO(this->get_logger(),
+                    "No goal available; selecting frontier with highest uncertainty");
+      }
       // Goal is not safe, find frontier subgoal and project it
       const int next_subgoal_index = GetNextSubgoal();
       if (next_subgoal_index >= 0) {
@@ -703,9 +739,11 @@ private:
         subgoal.y = projection_result.projected_point.get<1>();
         subgoal.z = 0.0;
 
-        // Publish visualization of the projection
-        publish_projected_goal_marker(current_goal_.point, subgoal,
-                                      projection_result.dist);
+        // Publish visualization of the projection when a goal is available
+        if (goal_received_) {
+          publish_projected_goal_marker(current_goal_.point, subgoal,
+                                        projection_result.dist);
+        }
 
         RCLCPP_INFO(this->get_logger(),
                     "Published projected subgoal: (%f, %f) (distance: %f)",
@@ -1324,6 +1362,7 @@ private:
   void
   goal_point_callback(const geometry_msgs::msg::PointStamped::SharedPtr msg) {
     current_goal_.point = msg->point;
+    goal_received_ = true;
   }
 
   void publish_subgoal_marker(const geometry_msgs::msg::Point &subgoal) {
