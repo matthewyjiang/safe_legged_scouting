@@ -36,14 +36,6 @@ find_package(Qt5 REQUIRED COMPONENTS Core Widgets)
 
 include(FetchContent)
 
-FetchContent_Declare(
-  mygal
-  GIT_REPOSITORY https://github.com/Serinox/MyGAL.git
-  GIT_TAG Patch_For_Building_Through_FetchContent
-)
-
-FetchContent_MakeAvailable(mygal)
-
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -99,7 +91,6 @@ target_link_libraries(
     reactive_navigation_node
     ${Boost_LIBRARIES}
     reactive_planner
-    mygal
     Qt5::Core
     Qt5::Widgets
     CGAL::CGAL
