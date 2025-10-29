@@ -31,6 +31,8 @@ find_package(CGAL REQUIRED COMPONENTS Core)
 find_package(Qhull REQUIRED)
 find_package(turtlesim REQUIRED)
 find_package(Qt5 REQUIRED COMPONENTS Core Widgets)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(CURL REQUIRED libcurl)
 
 # enable fetch content
 
@@ -51,6 +53,7 @@ ament_export_include_directories(
 
 include_directories(
   include
+  ${CURL_INCLUDE_DIRS}
 )
 
 
@@ -85,6 +88,7 @@ target_link_libraries(
     CGAL::CGAL
     CGAL::CGAL_Core
     reactive_planner
+    ${CURL_LIBRARIES}
 )
 
 target_link_libraries(
