@@ -46,7 +46,7 @@ public:
   OptimizerNode() : Node("optimizer_node") {
     // Declare parameters
     this->declare_parameter("opt.beta", 2.0);
-    this->declare_parameter("opt.f_min", 0.0);
+    this->declare_parameter("opt.f_max", 0.0);
     this->declare_parameter("terrain_map.resolution",
                             std::vector<double>{0.1, 0.1});
     this->declare_parameter("debug.publish_debug_image", false);
@@ -55,7 +55,7 @@ public:
 
     // Read parameters
     beta_ = this->get_parameter("opt.beta").as_double();
-    f_min_ = this->get_parameter("opt.f_min").as_double();
+    f_max_ = this->get_parameter("opt.f_max").as_double();
     auto resolution_vector =
         this->get_parameter("terrain_map.resolution").as_double_array();
     if (resolution_vector.size() != 2) {
@@ -137,7 +137,7 @@ private:
   Eigen::Matrix<double, Eigen::Dynamic, 2> Q_; // Confidence intervals
 
   double beta_;
-  double f_min_;
+  double f_max_;
   double subgoal_erosion_;
   double robot_radius_;
 
@@ -410,7 +410,7 @@ private:
     UpdateSafeSet();
   }
 
-  void UpdateSafeSet() { S_ = Q_.col(0).array() > f_min_; }
+  void UpdateSafeSet() { S_ = Q_.col(0).array() < f_max_; }
 
   void ComputeConfidenceIntervals() {
     const Eigen::VectorXd confidence = beta_ * std_;
@@ -1363,6 +1363,13 @@ private:
   goal_point_callback(const geometry_msgs::msg::PointStamped::SharedPtr msg) {
     current_goal_.point = msg->point;
     goal_received_ = true;
+
+    RCLCPP_INFO(this->get_logger(),
+                "New goal received: (%.2f, %.2f), requesting terrain map update",
+                msg->point.x, msg->point.y);
+
+    // Request terrain map to recompute subgoal with new goal
+    request_terrain_map();
   }
 
   void publish_subgoal_marker(const geometry_msgs::msg::Point &subgoal) {
