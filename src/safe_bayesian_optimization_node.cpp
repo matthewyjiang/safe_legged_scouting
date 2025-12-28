@@ -410,7 +410,10 @@ private:
     UpdateSafeSet();
   }
 
-  void UpdateSafeSet() { S_ = Q_.col(0).array() < f_max_; }
+  void UpdateSafeSet() {
+    // Safe if upper confidence bound (pessimistic/worst case) is below threshold
+    S_ = Q_.col(1).array() < f_max_;
+  }
 
   void ComputeConfidenceIntervals() {
     const Eigen::VectorXd confidence = beta_ * std_;
