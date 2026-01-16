@@ -47,15 +47,18 @@ public:
     // Declare parameters
     this->declare_parameter("opt.beta", 2.0);
     this->declare_parameter("opt.f_max", 0.0);
+    this->declare_parameter("opt.lipschitz", 1.0);
     this->declare_parameter("terrain_map.resolution",
                             std::vector<double>{0.1, 0.1});
     this->declare_parameter("debug.publish_debug_image", false);
     this->declare_parameter("opt.subgoal_erosion", 0.2);
     this->declare_parameter("robot.radius", 0.5);
+    this->declare_parameter("polygon.simplification_tolerance", 0.1);
 
     // Read parameters
     beta_ = this->get_parameter("opt.beta").as_double();
     f_max_ = this->get_parameter("opt.f_max").as_double();
+    lipschitz_L_ = this->get_parameter("opt.lipschitz").as_double();
     auto resolution_vector =
         this->get_parameter("terrain_map.resolution").as_double_array();
     if (resolution_vector.size() != 2) {
@@ -70,6 +73,7 @@ public:
         this->get_parameter("debug.publish_debug_image").as_bool();
     subgoal_erosion_ = this->get_parameter("opt.subgoal_erosion").as_double();
     robot_radius_ = this->get_parameter("robot.radius").as_double();
+    simplification_tolerance_ = this->get_parameter("polygon.simplification_tolerance").as_double();
 
     // Create service clients
     terrain_map_client_ = this->create_client<
@@ -124,6 +128,8 @@ public:
 
     // No goal received yet
     goal_received_ = false;
+    confidence_initialized_ = false;
+    safe_set_initialized_ = false;
 
     RCLCPP_INFO(this->get_logger(), "Optimizer Node Initialized");
   }
@@ -135,11 +141,15 @@ private:
   Eigen::Matrix<double, Eigen::Dynamic, 2> D_; // Parameter Set;
   Eigen::Matrix<bool, Eigen::Dynamic, 1> S_;   // Safe set
   Eigen::Matrix<double, Eigen::Dynamic, 2> Q_; // Confidence intervals
+  Eigen::VectorXd C_low_;  // Monotonic lower bounds
+  Eigen::VectorXd C_high_; // Monotonic upper bounds
 
   double beta_;
   double f_max_;
+  double lipschitz_L_;
   double subgoal_erosion_;
   double robot_radius_;
+  double simplification_tolerance_;
 
   // Spatial data monitoring
   rclcpp::Client<trusses_custom_interfaces::srv::GetTerrainMapWithUncertainty>::
@@ -179,6 +189,9 @@ private:
 
   // Timing variables for terrain map request
   std::chrono::steady_clock::time_point terrain_request_start_time_;
+
+  bool confidence_initialized_;
+  bool safe_set_initialized_;
 
   // Disjoint set data structure using map
   class DisjointSet {
@@ -401,25 +414,157 @@ private:
   }
 
   void ComputeSets() {
-    // Compute the confidence intervals
-    ComputeConfidenceIntervals();
-
-    // Debug print mu std, q and fmin
-
-    // Update the safe set based on the confidence intervals
-    UpdateSafeSet();
+    UpdateMonotonicConfidenceIntervals();
+    UpdateSafeSetWithLipschitz();
   }
 
-  void UpdateSafeSet() {
-    // Safe if upper confidence bound (pessimistic/worst case) is below threshold
-    S_ = Q_.col(1).array() < f_max_;
+  void InitializeConfidenceBoundsIfNeeded() {
+    if (C_low_.size() == mu_.size()) {
+      return;
+    }
+
+    const double neg_inf = -std::numeric_limits<double>::infinity();
+    const double pos_inf = std::numeric_limits<double>::infinity();
+
+    C_low_.resize(mu_.size());
+    C_high_.resize(mu_.size());
+    C_low_.setConstant(neg_inf);
+    C_high_.setConstant(pos_inf);
+
+    S_.resize(mu_.size());
+    S_.setConstant(false);
+
+    confidence_initialized_ = true;
+    safe_set_initialized_ = false;
   }
 
-  void ComputeConfidenceIntervals() {
-    const Eigen::VectorXd confidence = beta_ * std_;
+  void UpdateMonotonicConfidenceIntervals() {
+    InitializeConfidenceBoundsIfNeeded();
 
-    Q_.col(0) = mu_ - confidence;
-    Q_.col(1) = mu_ + confidence;
+    const double sqrt_beta = std::sqrt(beta_);
+    const Eigen::VectorXd confidence = sqrt_beta * std_;
+
+    const Eigen::VectorXd Q_low = mu_ - confidence;
+    const Eigen::VectorXd Q_high = mu_ + confidence;
+
+    Q_.col(0) = Q_low;
+    Q_.col(1) = Q_high;
+
+    C_low_ = C_low_.cwiseMax(Q_low);
+    C_high_ = C_high_.cwiseMin(Q_high);
+  }
+
+  void UpdateSafeSetWithLipschitz() {
+    if (S_.rows() == 0 || D_.rows() == 0) {
+      return;
+    }
+
+    if (lipschitz_L_ <= 0.0) {
+      RCLCPP_WARN(this->get_logger(),
+                  "Lipschitz constant <= 0; safe set will not expand.");
+      return;
+    }
+
+    const int n_points = D_.rows();
+    std::vector<char> safe_flags(n_points, 0);
+
+    std::vector<int> anchor_indices;
+    anchor_indices.reserve(n_points);
+
+    for (int i = 0; i < n_points; ++i) {
+      if (S_(i) || C_high_(i) <= f_max_) {
+        safe_flags[i] = 1;
+        anchor_indices.push_back(i);
+      }
+    }
+
+    const int width = terrain_width_cells_;
+    const int height = terrain_height_cells_;
+    const bool has_grid = (width > 0 && height > 0 &&
+                           static_cast<int>(width * height) == n_points);
+
+    if (has_grid) {
+      const double min_x = D_.col(0).minCoeff();
+      const double max_x = D_.col(0).maxCoeff();
+      const double min_y = D_.col(1).minCoeff();
+      const double max_y = D_.col(1).maxCoeff();
+      const double cell_width =
+          (width > 1) ? (max_x - min_x) / (width - 1) : terrain_x_resolution_;
+      const double cell_height =
+          (height > 1) ? (max_y - min_y) / (height - 1) : terrain_y_resolution_;
+      const double max_grid_dist =
+          std::hypot((width - 1) * cell_width, (height - 1) * cell_height);
+
+      for (int anchor : anchor_indices) {
+        const double u_anchor = C_high_(anchor);
+        const double margin = f_max_ - u_anchor;
+        if (margin < 0.0) {
+          continue;
+        }
+
+        const double radius = margin / lipschitz_L_;
+        if (radius >= max_grid_dist) {
+          for (int i = 0; i < n_points; ++i) {
+            safe_flags[i] = 1;
+          }
+          break;
+        }
+        const double radius_sq = radius * radius;
+
+        const int anchor_i = anchor / height;
+        const int anchor_j = anchor % height;
+        const int max_i_offset =
+            static_cast<int>(std::floor(radius / cell_width));
+        const int max_j_offset =
+            static_cast<int>(std::floor(radius / cell_height));
+
+        const int i_min = std::max(0, anchor_i - max_i_offset);
+        const int i_max = std::min(width - 1, anchor_i + max_i_offset);
+        const int j_min = std::max(0, anchor_j - max_j_offset);
+        const int j_max = std::min(height - 1, anchor_j + max_j_offset);
+
+        for (int i = i_min; i <= i_max; ++i) {
+          const double dx = (i - anchor_i) * cell_width;
+          const double dx_sq = dx * dx;
+          for (int j = j_min; j <= j_max; ++j) {
+            const int idx = i * height + j;
+            if (safe_flags[idx]) {
+              continue;
+            }
+            const double dy = (j - anchor_j) * cell_height;
+            const double dist_sq = dx_sq + dy * dy;
+            if (dist_sq <= radius_sq) {
+              safe_flags[idx] = 1;
+            }
+          }
+        }
+      }
+    } else {
+      for (int anchor : anchor_indices) {
+        const double u_anchor = C_high_(anchor);
+        const double margin = f_max_ - u_anchor;
+        if (margin < 0.0) {
+          continue;
+        }
+
+        const double radius = margin / lipschitz_L_;
+        const double radius_sq = radius * radius;
+
+        for (int j = 0; j < n_points; ++j) {
+          if (safe_flags[j]) {
+            continue;
+          }
+          const double dist_sq = (D_.row(anchor) - D_.row(j)).squaredNorm();
+          if (dist_sq <= radius_sq) {
+            safe_flags[j] = 1;
+          }
+        }
+      }
+    }
+
+    for (int i = 0; i < n_points; ++i) {
+      S_(i) = safe_flags[i];
+    }
   }
 
   std::vector<int> FindSafetyContourIndices() {
@@ -462,11 +607,11 @@ private:
       }
     }
 
-    // Find contours
+    // Find contours with hierarchy to properly handle holes
     std::vector<std::vector<cv::Point>> contours;
     std::vector<cv::Vec4i> hierarchy;
-    cv::findContours(safety_image, contours, hierarchy, cv::RETR_EXTERNAL,
-                     cv::CHAIN_APPROX_NONE);
+    cv::findContours(safety_image, contours, hierarchy, cv::RETR_CCOMP,
+                     cv::CHAIN_APPROX_SIMPLE);
 
     RCLCPP_INFO(this->get_logger(), "Found %lu contours", contours.size());
 
@@ -980,41 +1125,232 @@ private:
     //             "[MAIN] Successfully created %zu concave polygons",
     //             concave_polygons.size());
 
-    // Create single concave polygon from all safe points
-    RCLCPP_INFO(this->get_logger(), "[MAIN] Creating concave hull from all safe points...");
-    std::vector<int> all_safe_indices;
-    for (int i = 0; i < S_.rows(); ++i) {
-      if (S_(i)) {
-        all_safe_indices.push_back(i);
+    // Create polygons with holes using OpenCV contours (more efficient than Alpha Shapes)
+    RCLCPP_INFO(this->get_logger(), "[MAIN] Creating safe region polygons from contours...");
+
+    // Find grid bounds
+    double min_x = D_.col(0).minCoeff();
+    double max_x = D_.col(0).maxCoeff();
+    double min_y = D_.col(1).minCoeff();
+    double max_y = D_.col(1).maxCoeff();
+
+    // Use stored grid dimensions from service response
+    int width = terrain_width_cells_;
+    int height = terrain_height_cells_;
+
+    RCLCPP_INFO(this->get_logger(), "[MAIN] Grid bounds: X=[%.2f, %.2f], Y=[%.2f, %.2f], size=%dx%d",
+                min_x, max_x, min_y, max_y, width, height);
+
+    // Create binary image from safety data
+    cv::Mat safety_image = cv::Mat::zeros(height, width, CV_8UC1);
+
+    for (int i = 0; i < D_.rows(); ++i) {
+      int x = static_cast<int>((D_(i, 0) - min_x) / (max_x - min_x) * width);
+      int y = static_cast<int>((D_(i, 1) - min_y) / (max_y - min_y) * height);
+
+      if (x >= 0 && x < width && y >= 0 && y < height) {
+        safety_image.at<uchar>(y, x) = S_(i) ? 255 : 0;
       }
     }
 
-    if (all_safe_indices.size() < 3) {
-      RCLCPP_WARN(this->get_logger(),
-                  "[MAIN] Insufficient safe points (%zu) for polygon creation",
-                  all_safe_indices.size());
-      return;
-    }
+    // Find contours with hierarchy to detect holes
+    std::vector<std::vector<cv::Point>> contours;
+    std::vector<cv::Vec4i> hierarchy;
+    cv::findContours(safety_image, contours, hierarchy,
+                     cv::RETR_CCOMP,  // Retrieves all contours and organizes them into a two-level hierarchy
+                     cv::CHAIN_APPROX_SIMPLE);  // Compresses segments for efficiency
 
-    auto concave_polygon = create_concave_polygon_from_points(all_safe_indices);
-    if (concave_polygon.outer().empty()) {
-      RCLCPP_WARN(this->get_logger(),
-                  "[MAIN] Failed to create concave polygon from safe points");
-      return;
-    }
+    RCLCPP_INFO(this->get_logger(), "[MAIN] Found %zu contours from OpenCV", contours.size());
 
+    // Build polygons with holes from contour hierarchy
+    // hierarchy[i] = [next, previous, first_child, parent]
+    // parent == -1: outer boundary (safe region)
+    // parent >= 0: hole (unsafe island inside safe region)
     std::vector<bg::model::polygon<bg::model::d2::point_xy<double>>>
         concave_polygons;
-    concave_polygons.push_back(concave_polygon);
-
     std::vector<std::array<double, 2>> all_boundaries;
-    for (const auto &point : concave_polygon.outer()) {
-      all_boundaries.push_back({point.get<0>(), point.get<1>()});
+
+    for (size_t i = 0; i < contours.size(); ++i) {
+      // Process only outer boundaries (no parent)
+      if (hierarchy[i][3] == -1) {
+        bg::model::polygon<bg::model::d2::point_xy<double>> poly;
+
+        // Add outer boundary
+        for (const auto& pt : contours[i]) {
+          double world_x = min_x + (pt.x / (double)width) * (max_x - min_x);
+          double world_y = min_y + (pt.y / (double)height) * (max_y - min_y);
+          bg::append(poly.outer(), bg::model::d2::point_xy<double>(world_x, world_y));
+          all_boundaries.push_back({world_x, world_y});
+        }
+
+        RCLCPP_INFO(this->get_logger(), "[MAIN] Outer boundary %zu has %zu points",
+                    i, contours[i].size());
+
+        // Find and add holes (children of this outer boundary)
+        int hole_count = 0;
+        for (size_t j = 0; j < contours.size(); ++j) {
+          if (hierarchy[j][3] == (int)i) {  // This contour's parent is current outer boundary
+            poly.inners().resize(poly.inners().size() + 1);
+            for (const auto& pt : contours[j]) {
+              double world_x = min_x + (pt.x / (double)width) * (max_x - min_x);
+              double world_y = min_y + (pt.y / (double)height) * (max_y - min_y);
+              bg::append(poly.inners().back(),
+                        bg::model::d2::point_xy<double>(world_x, world_y));
+            }
+            hole_count++;
+            RCLCPP_INFO(this->get_logger(), "[MAIN]   Hole %d has %zu points",
+                        hole_count, contours[j].size());
+          }
+        }
+
+        // Ensure proper orientation (outer CCW, holes CW)
+        bg::correct(poly);
+
+        if (!poly.outer().empty()) {
+          concave_polygons.push_back(poly);
+          RCLCPP_INFO(this->get_logger(),
+                      "[MAIN] Created polygon with %zu outer points and %zu holes",
+                      poly.outer().size(), poly.inners().size());
+        }
+      }
+    }
+
+    if (concave_polygons.empty()) {
+      RCLCPP_WARN(this->get_logger(),
+                  "[MAIN] No valid polygons created from contours");
+      return;
     }
 
     RCLCPP_INFO(this->get_logger(),
-                "[MAIN] Successfully created single concave polygon with %zu boundary points",
-                concave_polygon.outer().size());
+                "[MAIN] Successfully created %zu safe region polygons using OpenCV contours",
+                concave_polygons.size());
+
+    // Apply conservative simplification: erode THEN simplify
+    // This guarantees safe regions only shrink → obstacles only grow
+    RCLCPP_INFO(this->get_logger(),
+                "[MAIN] Applying conservative polygon simplification (tolerance=%.3fm)...",
+                simplification_tolerance_);
+
+    double safety_erosion = 1.5 * simplification_tolerance_;  // Conservative: erode by 1.5x tolerance
+
+    std::vector<bg::model::polygon<bg::model::d2::point_xy<double>>>
+        simplified_polygons;
+
+    for (size_t i = 0; i < concave_polygons.size(); ++i) {
+      size_t orig_outer_vertices = concave_polygons[i].outer().size();
+      size_t orig_inner_vertices = 0;
+      for (const auto& inner : concave_polygons[i].inners()) {
+        orig_inner_vertices += inner.size();
+      }
+
+      // Process outer boundary and holes separately for conservative simplification
+      bg::strategy::buffer::join_round join_strategy;
+      bg::strategy::buffer::end_round end_strategy;
+      bg::strategy::buffer::point_circle point_strategy;
+      bg::strategy::buffer::side_straight side_strategy;
+
+      // Step 1: Erode outer boundary (shrink safe region)
+      bg::model::polygon<bg::model::d2::point_xy<double>> outer_only;
+      outer_only.outer() = concave_polygons[i].outer();
+      bg::correct(outer_only);
+
+      bg::strategy::buffer::distance_symmetric<double> erosion_distance(-safety_erosion);
+      bg::model::multi_polygon<bg::model::polygon<bg::model::d2::point_xy<double>>>
+          eroded_outer_multi;
+      bg::buffer(outer_only, eroded_outer_multi, erosion_distance,
+                 side_strategy, join_strategy, end_strategy, point_strategy);
+
+      if (eroded_outer_multi.empty()) {
+        RCLCPP_WARN(this->get_logger(),
+                    "[MAIN] Polygon %zu outer boundary disappeared after erosion - skipping", i);
+        continue;
+      }
+
+      // Step 2: Dilate holes (expand unsafe regions inside)
+      std::vector<bg::model::polygon<bg::model::d2::point_xy<double>>> dilated_holes;
+
+      for (const auto& hole : concave_polygons[i].inners()) {
+        bg::model::polygon<bg::model::d2::point_xy<double>> hole_poly;
+        hole_poly.outer() = hole;
+        bg::correct(hole_poly);
+
+        bg::strategy::buffer::distance_symmetric<double> dilation_distance(safety_erosion);
+        bg::model::multi_polygon<bg::model::polygon<bg::model::d2::point_xy<double>>>
+            dilated_hole_multi;
+        bg::buffer(hole_poly, dilated_hole_multi, dilation_distance,
+                   side_strategy, join_strategy, end_strategy, point_strategy);
+
+        if (!dilated_hole_multi.empty()) {
+          dilated_holes.push_back(dilated_hole_multi[0]);
+        }
+      }
+
+      RCLCPP_INFO(this->get_logger(),
+                  "[MAIN] Polygon %zu: outer eroded, %zu holes dilated",
+                  i, dilated_holes.size());
+
+      // Step 3: Simplify outer boundary
+      bg::model::polygon<bg::model::d2::point_xy<double>> simplified_outer;
+      bg::simplify(eroded_outer_multi[0], simplified_outer, simplification_tolerance_);
+
+      if (simplified_outer.outer().empty()) {
+        RCLCPP_WARN(this->get_logger(),
+                    "[MAIN] Polygon %zu outer disappeared after simplification - skipping", i);
+        continue;
+      }
+
+      // Step 4: Simplify holes
+      std::vector<bg::model::polygon<bg::model::d2::point_xy<double>>> simplified_holes;
+      for (const auto& dilated_hole : dilated_holes) {
+        bg::model::polygon<bg::model::d2::point_xy<double>> simplified_hole;
+        bg::simplify(dilated_hole, simplified_hole, simplification_tolerance_);
+
+        if (!simplified_hole.outer().empty()) {
+          simplified_holes.push_back(simplified_hole);
+        }
+      }
+
+      // Step 5: Combine outer boundary with holes
+      bg::model::polygon<bg::model::d2::point_xy<double>> final_poly;
+      final_poly.outer() = simplified_outer.outer();
+
+      // Add simplified holes as inner rings
+      for (const auto& hole : simplified_holes) {
+        final_poly.inners().push_back(hole.outer());
+      }
+
+      bg::correct(final_poly);
+
+      if (!final_poly.outer().empty()) {
+        size_t final_outer_vertices = final_poly.outer().size();
+        size_t final_inner_vertices = 0;
+        for (const auto& inner : final_poly.inners()) {
+          final_inner_vertices += inner.size();
+        }
+
+        simplified_polygons.push_back(final_poly);
+
+        RCLCPP_INFO(this->get_logger(),
+                    "[MAIN] Polygon %zu: vertices %zu→%zu (outer), %zu→%zu (inner holes), reduction: %.1f%%",
+                    i, orig_outer_vertices, final_outer_vertices,
+                    orig_inner_vertices, final_inner_vertices,
+                    100.0 * (1.0 - (double)(final_outer_vertices + final_inner_vertices) /
+                             (double)(orig_outer_vertices + orig_inner_vertices)));
+      }
+    }
+
+    if (simplified_polygons.empty()) {
+      RCLCPP_WARN(this->get_logger(),
+                  "[MAIN] All polygons disappeared after simplification - using originals");
+      simplified_polygons = concave_polygons;
+    } else {
+      RCLCPP_INFO(this->get_logger(),
+                  "[MAIN] Successfully simplified %zu→%zu polygons with safety guarantee",
+                  concave_polygons.size(), simplified_polygons.size());
+    }
+
+    // Use simplified polygons for remaining operations
+    concave_polygons = simplified_polygons;
 
     // Find the largest polygon for subgoal projection (or use first one)
     RCLCPP_INFO(this->get_logger(),
@@ -1314,6 +1650,7 @@ private:
       if (outer_ring.size() < 3)
         continue; // Skip invalid polygons
 
+      // Draw outer boundary
       std::vector<cv::Point> cv_points;
       cv_points.reserve(outer_ring.size()); // Reserve capacity
 
@@ -1327,6 +1664,28 @@ private:
         int npts = static_cast<int>(cv_points.size());
         cv::fillPoly(debug_img, &pts, &npts, 1, cv::Scalar(255, 100, 0));
         cv::polylines(debug_img, cv_points, true, cv::Scalar(255, 255, 0), 2);
+      }
+
+      // Draw holes in obstacle polygons (safe regions inside obstacles) if any
+      for (const auto &inner_ring : polygon.inners()) {
+        if (inner_ring.size() < 3)
+          continue;
+
+        std::vector<cv::Point> inner_cv_points;
+        inner_cv_points.reserve(inner_ring.size());
+
+        for (const auto &point : inner_ring) {
+          cv::Point img_point = world_to_image(point.get<0>(), point.get<1>());
+          inner_cv_points.push_back(img_point);
+        }
+
+        if (inner_cv_points.size() > 2) {
+          // Fill holes with green (safe regions inside obstacles)
+          const cv::Point *inner_pts = inner_cv_points.data();
+          int inner_npts = static_cast<int>(inner_cv_points.size());
+          cv::fillPoly(debug_img, &inner_pts, &inner_npts, 1, cv::Scalar(0, 150, 0));
+          cv::polylines(debug_img, inner_cv_points, true, cv::Scalar(0, 255, 0), 2);
+        }
       }
     }
 
@@ -1406,37 +1765,76 @@ private:
           &concave_polygon) {
     auto marker_array = visualization_msgs::msg::MarkerArray();
 
-    // Create a marker for the concave polygon
-    auto marker = visualization_msgs::msg::Marker();
-    marker.header.frame_id = "map";
-    marker.header.stamp = this->now();
-    marker.ns = "concave";
-    marker.id = 0;
-    marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
-    marker.action = visualization_msgs::msg::Marker::ADD;
+    int marker_id = 0;
+
+    // Create a marker for the outer boundary
+    auto outer_marker = visualization_msgs::msg::Marker();
+    outer_marker.header.frame_id = "map";
+    outer_marker.header.stamp = this->now();
+    outer_marker.ns = "concave_outer";
+    outer_marker.id = marker_id++;
+    outer_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    outer_marker.action = visualization_msgs::msg::Marker::ADD;
 
     // Set marker properties
-    marker.scale.x = 0.06; // Line width
-    marker.color.r = 0.0;
-    marker.color.g = 0.0;
-    marker.color.b = 1.0;
-    marker.color.a = 0.8;
+    outer_marker.scale.x = 0.06; // Line width
+    outer_marker.color.r = 0.0;
+    outer_marker.color.g = 0.0;
+    outer_marker.color.b = 1.0;
+    outer_marker.color.a = 0.8;
 
-    // Convert concave polygon points to marker points
+    // Convert concave polygon outer boundary points to marker points
     for (const auto &boost_point : concave_polygon.outer()) {
       geometry_msgs::msg::Point point;
       point.x = boost_point.get<0>();
       point.y = boost_point.get<1>();
       point.z = 0.0;
-      marker.points.push_back(point);
+      outer_marker.points.push_back(point);
     }
 
     // Close the polygon by adding the first point at the end
-    if (!marker.points.empty()) {
-      marker.points.push_back(marker.points[0]);
+    if (!outer_marker.points.empty()) {
+      outer_marker.points.push_back(outer_marker.points[0]);
     }
 
-    marker_array.markers.push_back(marker);
+    marker_array.markers.push_back(outer_marker);
+
+    // Create markers for holes (unsafe regions inside)
+    for (size_t hole_idx = 0; hole_idx < concave_polygon.inners().size(); ++hole_idx) {
+      const auto &hole = concave_polygon.inners()[hole_idx];
+
+      auto hole_marker = visualization_msgs::msg::Marker();
+      hole_marker.header.frame_id = "map";
+      hole_marker.header.stamp = this->now();
+      hole_marker.ns = "concave_holes";
+      hole_marker.id = marker_id++;
+      hole_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+      hole_marker.action = visualization_msgs::msg::Marker::ADD;
+
+      // Set hole marker properties - use red to indicate unsafe regions
+      hole_marker.scale.x = 0.06; // Line width
+      hole_marker.color.r = 1.0;  // Red for unsafe
+      hole_marker.color.g = 0.0;
+      hole_marker.color.b = 0.0;
+      hole_marker.color.a = 0.8;
+
+      // Convert hole points to marker points
+      for (const auto &boost_point : hole) {
+        geometry_msgs::msg::Point point;
+        point.x = boost_point.get<0>();
+        point.y = boost_point.get<1>();
+        point.z = 0.0;
+        hole_marker.points.push_back(point);
+      }
+
+      // Close the hole by adding the first point at the end
+      if (!hole_marker.points.empty()) {
+        hole_marker.points.push_back(hole_marker.points[0]);
+      }
+
+      marker_array.markers.push_back(hole_marker);
+    }
+
     concave_markers_pub_->publish(marker_array);
   }
 
@@ -1457,40 +1855,79 @@ private:
         {1.0, 0.5, 0.0}  // Orange
     };
 
+    int marker_id = 0;
+
     for (size_t i = 0; i < concave_polygons.size(); ++i) {
       const auto &concave_polygon = concave_polygons[i];
 
-      auto marker = visualization_msgs::msg::Marker();
-      marker.header.frame_id = "map";
-      marker.header.stamp = this->now();
-      marker.ns = "concave_multiple";
-      marker.id = static_cast<int>(i);
-      marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
-      marker.action = visualization_msgs::msg::Marker::ADD;
+      // Draw outer boundary (safe region boundary)
+      auto outer_marker = visualization_msgs::msg::Marker();
+      outer_marker.header.frame_id = "map";
+      outer_marker.header.stamp = this->now();
+      outer_marker.ns = "concave_outer";
+      outer_marker.id = marker_id++;
+      outer_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+      outer_marker.action = visualization_msgs::msg::Marker::ADD;
 
       // Set marker properties
-      marker.scale.x = 0.06; // Line width
+      outer_marker.scale.x = 0.06; // Line width
       auto &color = colors[i % colors.size()];
-      marker.color.r = color[0];
-      marker.color.g = color[1];
-      marker.color.b = color[2];
-      marker.color.a = 0.8;
+      outer_marker.color.r = color[0];
+      outer_marker.color.g = color[1];
+      outer_marker.color.b = color[2];
+      outer_marker.color.a = 0.8;
 
-      // Convert concave polygon points to marker points
+      // Convert concave polygon outer boundary points to marker points
       for (const auto &boost_point : concave_polygon.outer()) {
         geometry_msgs::msg::Point point;
         point.x = boost_point.get<0>();
         point.y = boost_point.get<1>();
         point.z = 0.0;
-        marker.points.push_back(point);
+        outer_marker.points.push_back(point);
       }
 
       // Close the polygon by adding the first point at the end
-      if (!marker.points.empty()) {
-        marker.points.push_back(marker.points[0]);
+      if (!outer_marker.points.empty()) {
+        outer_marker.points.push_back(outer_marker.points[0]);
       }
 
-      marker_array.markers.push_back(marker);
+      marker_array.markers.push_back(outer_marker);
+
+      // Draw holes (unsafe regions inside safe region)
+      for (size_t hole_idx = 0; hole_idx < concave_polygon.inners().size(); ++hole_idx) {
+        const auto &hole = concave_polygon.inners()[hole_idx];
+
+        auto hole_marker = visualization_msgs::msg::Marker();
+        hole_marker.header.frame_id = "map";
+        hole_marker.header.stamp = this->now();
+        hole_marker.ns = "concave_holes";
+        hole_marker.id = marker_id++;
+        hole_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+        hole_marker.action = visualization_msgs::msg::Marker::ADD;
+
+        // Set hole marker properties - use red to indicate unsafe regions
+        hole_marker.scale.x = 0.06; // Line width
+        hole_marker.color.r = 1.0;  // Red for unsafe
+        hole_marker.color.g = 0.0;
+        hole_marker.color.b = 0.0;
+        hole_marker.color.a = 0.8;
+
+        // Convert hole points to marker points
+        for (const auto &boost_point : hole) {
+          geometry_msgs::msg::Point point;
+          point.x = boost_point.get<0>();
+          point.y = boost_point.get<1>();
+          point.z = 0.0;
+          hole_marker.points.push_back(point);
+        }
+
+        // Close the hole by adding the first point at the end
+        if (!hole_marker.points.empty()) {
+          hole_marker.points.push_back(hole_marker.points[0]);
+        }
+
+        marker_array.markers.push_back(hole_marker);
+      }
     }
 
     concave_markers_pub_->publish(marker_array);
