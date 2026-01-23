@@ -71,7 +71,7 @@ Parameters can be configured in:
 
 ### `config/safe_bayesian_optimization.yaml`:
 - `opt.beta`: Exploration parameter for acquisition function
-- `opt.f_min`: Minimum function value threshold
+- `opt.f_max`: Maximum function value threshold
 - `terrain_map.*`: Terrain map dimensions and resolution
 
 ### `config/reactive_planner.yaml`:

@@ -1,9 +1,9 @@
 safe_bayesian_optimization_node:
   ros__parameters:
-    opt: 
+    opt:
       beta: 2.0
       lipshitz: 1.0
-      f_min: 500.0
+      f_max: 500.0
       subgoal_erosion: 0.4
       
     # Terrain map request parameters
