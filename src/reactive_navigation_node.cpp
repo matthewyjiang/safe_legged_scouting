@@ -12,7 +12,6 @@
 #include <fstream>
 #include <geometry_msgs/msg/polygon.hpp>
 #include <geometry_msgs/msg/pose.hpp>
-#include <geometry_msgs/msg/twist.hpp>
 #include <iomanip>
 #include <rclcpp/rclcpp.hpp>
 #include <tf2/LinearMath/Matrix3x3.h>
@@ -104,7 +103,7 @@ public:
 
     // Create control command publisher
     cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(
-        "spirit/ghost_trot_control", 10);
+        "spirit/planner_twist_command", 10);
 
     // Publish a trigger when the current subgoal is reached
     subgoal_reached_pub_ =
