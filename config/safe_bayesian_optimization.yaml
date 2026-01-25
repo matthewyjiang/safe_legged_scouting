@@ -5,6 +5,7 @@ safe_bayesian_optimization_node:
       lipshitz: 1.0
       f_max: 500.0
       subgoal_erosion: 0.4
+      preference_order: ["g", "l", "e"]
       
     # Terrain map request parameters
     terrain_map:
@@ -16,6 +17,9 @@ safe_bayesian_optimization_node:
     # Debug configuration
     debug:
       publish_debug_image: false
+
+    robot:
+      pose_topic: "spirit/current_pose"
       
     # Node configuration
     node:
