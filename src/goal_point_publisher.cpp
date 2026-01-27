@@ -207,19 +207,22 @@ private:
       marker.scale.z = 0.3;
 
       if (i < current_waypoint_index_) {
+        // Past goals: cyan
         marker.color.r = 0.0;
         marker.color.g = 1.0;
-        marker.color.b = 0.0;
+        marker.color.b = 1.0;
         marker.color.a = 0.7;
       } else if (i == current_waypoint_index_) {
+        // Current goal: yellow
         marker.color.r = 1.0;
-        marker.color.g = 0.0;
+        marker.color.g = 1.0;
         marker.color.b = 0.0;
         marker.color.a = 1.0;
       } else {
+        // Future goals: lime
         marker.color.r = 0.0;
-        marker.color.g = 0.0;
-        marker.color.b = 1.0;
+        marker.color.g = 1.0;
+        marker.color.b = 0.0;
         marker.color.a = 0.5;
       }
 
