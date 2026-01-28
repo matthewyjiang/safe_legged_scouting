@@ -14,6 +14,7 @@
 #include <geometry_msgs/msg/pose.hpp>
 #include <iomanip>
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/empty.hpp>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -21,7 +22,6 @@
 #include <tf2_ros/transform_listener.h>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
-#include <std_msgs/msg/empty.hpp>
 
 namespace bg = boost::geometry;
 
@@ -42,7 +42,7 @@ public:
     this->declare_parameter("linear_cmd_limit", 0.5);
     this->declare_parameter("angular_cmd_limit", 1.0);
     this->declare_parameter("goal_tolerance", 0.1);
-    this->declare_parameter("goal_tolerance_hold_time", 0.0);
+    this->declare_parameter("next_subgoal_tolerance", 0.1);
 
     // Read parameters and configure diffeomorphism parameters
     double p = this->get_parameter("p").as_double();
@@ -56,8 +56,8 @@ public:
     linear_cmd_limit_ = this->get_parameter("linear_cmd_limit").as_double();
     angular_cmd_limit_ = this->get_parameter("angular_cmd_limit").as_double();
     goal_tolerance_ = this->get_parameter("goal_tolerance").as_double();
-    goal_tolerance_hold_time_ =
-        this->get_parameter("goal_tolerance_hold_time").as_double();
+    next_subgoal_tolerance_ =
+        this->get_parameter("next_subgoal_tolerance").as_double();
 
     // Set default workspace (will be updated when envelope is received)
     std::vector<std::vector<double>> default_workspace = {
@@ -67,14 +67,15 @@ public:
     diffeo_params_.set_all_params(p, epsilon, varepsilon, mu_1, mu_2,
                                   default_workspace);
 
-    RCLCPP_INFO(this->get_logger(),
-                "Configured reactive planner with p=%.2f, epsilon=%.3f, "
-                "varepsilon=%.3f, mu_1=%.2f, mu_2=%.2f, robot_radius=%.3f, "
-                "linear_gain=%.2f, angular_gain=%.2f, linear_limit=%.2f, "
-                "angular_limit=%.2f, goal_tolerance=%.3f, hold_time=%.2f",
-                p, epsilon, varepsilon, mu_1, mu_2, robot_radius_, linear_gain_,
-                angular_gain_, linear_cmd_limit_, angular_cmd_limit_,
-                goal_tolerance_, goal_tolerance_hold_time_);
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Configured reactive planner with p=%.2f, epsilon=%.3f, "
+        "varepsilon=%.3f, mu_1=%.2f, mu_2=%.2f, robot_radius=%.3f, "
+        "linear_gain=%.2f, angular_gain=%.2f, linear_limit=%.2f, "
+        "angular_limit=%.2f, goal_tolerance=%.3f, next_subgoal_tol=%.3f",
+        p, epsilon, varepsilon, mu_1, mu_2, robot_radius_, linear_gain_,
+        angular_gain_, linear_cmd_limit_, angular_cmd_limit_, goal_tolerance_,
+        next_subgoal_tolerance_);
 
     // Subscribe to obstacle polygons
     obstacles_sub_ = this->create_subscription<
@@ -205,7 +206,7 @@ private:
   double linear_cmd_limit_;
   double angular_cmd_limit_;
   double goal_tolerance_;
-  double goal_tolerance_hold_time_;
+  double next_subgoal_tolerance_;
   std::vector<polygon> obstacle_polygons_;
   std::vector<std::vector<PolygonClass>> diffeo_tree_array_;
 
@@ -218,8 +219,6 @@ private:
   geometry_msgs::msg::Point current_subgoal_;
   bool has_subgoal_ = false;
   bool subgoal_reached_ = false;
-  bool in_tolerance_ = false;
-  rclcpp::Time tolerance_start_time_;
   double env_x_min_ = 0.0;
   double env_x_max_ = 0.0;
   double env_y_min_ = 0.0;
@@ -409,8 +408,9 @@ private:
     const size_t max_index = outer.size() - 1; // skip duplicate close point
     for (size_t i = 0; i < max_index; ++i) {
       std::vector<double> position = {outer[i].get<0>(), outer[i].get<1>()};
-      DiffeoTransformResult transform_result = computeDiffeoTransform(
-          position, 0.0, diffeo_tree_array_, diffeo_params_, this->get_logger());
+      DiffeoTransformResult transform_result =
+          computeDiffeoTransform(position, 0.0, diffeo_tree_array_,
+                                 diffeo_params_, this->get_logger());
       bg::append(envelope_polygon_diffeo.outer(),
                  bg::model::point<double, 2, bg::cs::cartesian>(
                      transform_result.transformed_position[0],
@@ -455,9 +455,9 @@ private:
     // Store the envelope polygon in map frame for later diffeo transform
     envelope_polygon_map_.outer().clear();
     for (const auto &point : msg->points) {
-      bg::append(envelope_polygon_map_.outer(),
-                 bg::model::point<double, 2, bg::cs::cartesian>(point.x,
-                                                                point.y));
+      bg::append(
+          envelope_polygon_map_.outer(),
+          bg::model::point<double, 2, bg::cs::cartesian>(point.x, point.y));
     }
     if (!envelope_polygon_map_.outer().empty()) {
       bg::append(envelope_polygon_map_.outer(),
@@ -473,7 +473,6 @@ private:
     current_subgoal_ = *msg;
     has_subgoal_ = true;
     subgoal_reached_ = false;
-    in_tolerance_ = false;
 
     RCLCPP_INFO(this->get_logger(), "Received subgoal: x=%.3f, y=%.3f, z=%.3f",
                 current_subgoal_.x, current_subgoal_.y, current_subgoal_.z);
@@ -651,26 +650,19 @@ private:
     double dW_virtual = angular_ctl_gain * std::atan2(tW2, tW1);
     double angular_cmd = (dW_virtual - linear_cmd * DksiCosSin) / dksi_dpsi;
 
-    // Check if robot is within goal tolerance of subgoal
+    // Check if robot is within tolerance of subgoal
     double distance_to_subgoal =
         sqrt(pow(current_subgoal_.x - current_position_.x, 2) +
              pow(current_subgoal_.y - current_position_.y, 2));
 
-    if (distance_to_subgoal <= goal_tolerance_) {
-      const auto now = this->get_clock()->now();
-      if (!in_tolerance_) {
-        in_tolerance_ = true;
-        tolerance_start_time_ = now;
-      }
-
-      const double in_tolerance_sec =
-          (now - tolerance_start_time_).seconds();
-      if (!subgoal_reached_ &&
-          in_tolerance_sec >= goal_tolerance_hold_time_) {
+    if (distance_to_subgoal <= next_subgoal_tolerance_) {
+      if (!subgoal_reached_) {
         subgoal_reached_pub_->publish(std_msgs::msg::Empty());
         subgoal_reached_ = true;
       }
+    }
 
+    if (distance_to_subgoal <= goal_tolerance_) {
       // Robot is within goal tolerance, stop movement
       cmd_vel.linear.x = 0.0;
       cmd_vel.linear.y = 0.0;
@@ -682,7 +674,6 @@ private:
                   "Robot within goal tolerance (%.3f <= %.3f), stopping",
                   distance_to_subgoal, goal_tolerance_);
     } else {
-      in_tolerance_ = false;
       // Normal control commands
       cmd_vel.linear.x =
           std::max(-linear_cmd_limit_, std::min(linear_cmd, linear_cmd_limit_));
@@ -1000,7 +991,7 @@ private:
       free_space_line.push_back(robot_position);
       free_space_line.push_back(robot_position);
     } else {
-      const double erosion_distance = 0.15; // Erosion distance in meters
+      const double erosion_distance = 0.015; // Erosion distance in meters
 
       // Create eroded polygon using multi-polygon as intermediate
       std::vector<polygon> eroded_multipolygon;

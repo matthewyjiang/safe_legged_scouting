@@ -11,6 +11,9 @@
 class GoalPointPublisher : public rclcpp::Node {
 public:
   GoalPointPublisher() : Node("goal_point_publisher") {
+    this->declare_parameter("exploration_mode", false);
+    exploration_mode_ = this->get_parameter("exploration_mode").as_bool();
+
     publisher_ = this->create_publisher<geometry_msgs::msg::PointStamped>(
         "goal_point", 10);
 
@@ -49,7 +52,9 @@ public:
     
     publish_all_goal_markers();
 
-    RCLCPP_INFO(this->get_logger(), "Goal Point Publisher initialized with %zu waypoints", waypoints_.size());
+    RCLCPP_INFO(this->get_logger(),
+                "Goal Point Publisher initialized with %zu waypoints (exploration_mode=%s)",
+                waypoints_.size(), exploration_mode_ ? "true" : "false");
   }
 
 private:
@@ -86,6 +91,9 @@ private:
   }
 
   void check_waypoint_progress() {
+    if (exploration_mode_) {
+      return;
+    }
     if (waypoints_.empty() || current_waypoint_index_ >= waypoints_.size()) {
       return;
     }
@@ -246,6 +254,7 @@ private:
   size_t current_waypoint_index_;
   geometry_msgs::msg::Pose current_pose_;
   bool pose_received_ = false;
+  bool exploration_mode_ = false;
 };
 
 int main(int argc, char *argv[]) {

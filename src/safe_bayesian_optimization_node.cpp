@@ -150,6 +150,7 @@ public:
     // No goal received yet
     goal_received_ = false;
     last_subgoal_valid_ = false;
+    new_subgoal_requested_ = false;
     has_robot_pose_ = false;
     confidence_initialized_ = false;
     safe_set_initialized_ = false;
@@ -218,6 +219,7 @@ private:
   bool goal_received_;
   geometry_msgs::msg::Point last_subgoal_;
   bool last_subgoal_valid_;
+  bool new_subgoal_requested_;
   geometry_msgs::msg::Point current_robot_position_;
   bool has_robot_pose_;
   enum class PreferenceMetric { Goal, Last, Expansion };
@@ -969,6 +971,7 @@ private:
   void subgoal_reached_callback(const std_msgs::msg::Empty::SharedPtr) {
     RCLCPP_INFO(this->get_logger(),
                 "Subgoal reached; requesting terrain map update");
+    new_subgoal_requested_ = true;
     request_terrain_map();
   }
 
@@ -1066,112 +1069,118 @@ private:
     publish_obstacle_polygons();
     const auto publish_polygons_end = std::chrono::steady_clock::now();
 
-    // Check if the goal itself is safe by checking if it's within the eroded
-    // polygon
-    bg::model::d2::point_xy<double> goal_point(current_goal_.point.x,
-                                               current_goal_.point.y);
-
-    geometry_msgs::msg::Point subgoal;
     const auto subgoal_start = std::chrono::steady_clock::now();
-    if (goal_received_ && bg::within(goal_point, eroded_concave_polygon_)) {
-      // Goal is safe, use it directly as the subgoal
-      subgoal.x = current_goal_.point.x;
-      subgoal.y = current_goal_.point.y;
-      subgoal.z = 0.0;
+    const bool should_select_subgoal = new_subgoal_requested_ || !last_subgoal_valid_;
+    if (should_select_subgoal) {
+      // Check if the goal itself is safe by checking if it's within the eroded
+      // polygon
+      bg::model::d2::point_xy<double> goal_point(current_goal_.point.x,
+                                                 current_goal_.point.y);
 
-      RCLCPP_INFO(
-          this->get_logger(),
-          "Goal is within eroded safe region, using goal as subgoal: (%f, %f)",
-          subgoal.x, subgoal.y);
-    } else {
-      if (!goal_received_) {
-        RCLCPP_INFO(this->get_logger(),
-                    "No goal available; selecting frontier with highest uncertainty");
-      }
-      const auto get_subgoal_start = std::chrono::steady_clock::now();
-      // Goal is not safe, find frontier subgoal and project it
-      const int next_subgoal_index = GetNextSubgoal();
-      const auto get_subgoal_end = std::chrono::steady_clock::now();
-      if (next_subgoal_index >= 0) {
-        // Get the raw subgoal from the terrain map
-        double raw_x = response->x_coords[next_subgoal_index];
-        double raw_y = response->y_coords[next_subgoal_index];
-
-        // Convert boost polygon to polygeom_lib polygon format
-        polygon eroded_poly_for_projection;
-        for (const auto &boost_point : eroded_concave_polygon_.outer()) {
-          point polygeom_point(boost_point.get<0>(), boost_point.get<1>());
-          eroded_poly_for_projection.outer().push_back(polygeom_point);
-        }
-
-        bg::correct(eroded_poly_for_projection);
-
-        RCLCPP_INFO(this->get_logger(),
-                    "Next subgoal index: %d, coordinates: (%f, %f)",
-                    next_subgoal_index, raw_x, raw_y);
-
-        // Create point from raw subgoal coordinates
-        point raw_subgoal_point(raw_x, raw_y);
-
-        // Project the subgoal onto the eroded safe region using polydist
-        const auto project_start = std::chrono::steady_clock::now();
-        ProjectionResultStruct projection_result =
-            polydist(eroded_poly_for_projection, raw_subgoal_point);
-        const auto project_end = std::chrono::steady_clock::now();
-
-        RCLCPP_INFO(this->get_logger(),
-                    "Projected subgoal point: (%f, %f), distance: %f",
-                    projection_result.projected_point.get<0>(),
-                    projection_result.projected_point.get<1>(),
-                    projection_result.dist);
-
-        // Create final subgoal message from projected point
-        subgoal.x = projection_result.projected_point.get<0>();
-        subgoal.y = projection_result.projected_point.get<1>();
+      geometry_msgs::msg::Point subgoal;
+      if (goal_received_ && bg::within(goal_point, eroded_concave_polygon_)) {
+        // Goal is safe, use it directly as the subgoal
+        subgoal.x = current_goal_.point.x;
+        subgoal.y = current_goal_.point.y;
         subgoal.z = 0.0;
 
-        // Publish visualization of the projection when a goal is available
-        if (goal_received_) {
-          const auto marker_start = std::chrono::steady_clock::now();
-          publish_projected_goal_marker(current_goal_.point, subgoal,
-                                        projection_result.dist);
-          const auto marker_end = std::chrono::steady_clock::now();
-          RCLCPP_INFO(this->get_logger(),
-                      "Timing: publish_projected_goal_marker=%ld ms",
-                      std::chrono::duration_cast<std::chrono::milliseconds>(
-                          marker_end - marker_start)
-                          .count());
-        }
-
-        RCLCPP_INFO(this->get_logger(),
-                    "Published projected subgoal: (%f, %f) (distance: %f)",
-                    subgoal.x, subgoal.y, projection_result.dist);
-        RCLCPP_INFO(this->get_logger(),
-                    "Timing: GetNextSubgoal=%ld ms, polydist=%ld ms",
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        get_subgoal_end - get_subgoal_start)
-                        .count(),
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        project_end - project_start)
-                        .count());
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Goal is within eroded safe region, using goal as subgoal: (%f, %f)",
+            subgoal.x, subgoal.y);
       } else {
-        RCLCPP_WARN(this->get_logger(), "No valid subgoal found");
-        return;
+        if (!goal_received_) {
+          RCLCPP_INFO(this->get_logger(),
+                      "No goal available; selecting frontier with highest uncertainty");
+        }
+        const auto get_subgoal_start = std::chrono::steady_clock::now();
+        // Goal is not safe, find frontier subgoal and project it
+        const int next_subgoal_index = GetNextSubgoal();
+        const auto get_subgoal_end = std::chrono::steady_clock::now();
+        if (next_subgoal_index >= 0) {
+          // Get the raw subgoal from the terrain map
+          double raw_x = response->x_coords[next_subgoal_index];
+          double raw_y = response->y_coords[next_subgoal_index];
+
+          // Convert boost polygon to polygeom_lib polygon format
+          polygon eroded_poly_for_projection;
+          for (const auto &boost_point : eroded_concave_polygon_.outer()) {
+            point polygeom_point(boost_point.get<0>(), boost_point.get<1>());
+            eroded_poly_for_projection.outer().push_back(polygeom_point);
+          }
+
+          bg::correct(eroded_poly_for_projection);
+
+          RCLCPP_INFO(this->get_logger(),
+                      "Next subgoal index: %d, coordinates: (%f, %f)",
+                      next_subgoal_index, raw_x, raw_y);
+
+          // Create point from raw subgoal coordinates
+          point raw_subgoal_point(raw_x, raw_y);
+
+          // Project the subgoal onto the eroded safe region using polydist
+          const auto project_start = std::chrono::steady_clock::now();
+          ProjectionResultStruct projection_result =
+              polydist(eroded_poly_for_projection, raw_subgoal_point);
+          const auto project_end = std::chrono::steady_clock::now();
+
+          RCLCPP_INFO(this->get_logger(),
+                      "Projected subgoal point: (%f, %f), distance: %f",
+                      projection_result.projected_point.get<0>(),
+                      projection_result.projected_point.get<1>(),
+                      projection_result.dist);
+
+          // Create final subgoal message from projected point
+          subgoal.x = projection_result.projected_point.get<0>();
+          subgoal.y = projection_result.projected_point.get<1>();
+          subgoal.z = 0.0;
+
+          // Publish visualization of the projection when a goal is available
+          if (goal_received_) {
+            const auto marker_start = std::chrono::steady_clock::now();
+            publish_projected_goal_marker(current_goal_.point, subgoal,
+                                          projection_result.dist);
+            const auto marker_end = std::chrono::steady_clock::now();
+            RCLCPP_INFO(this->get_logger(),
+                        "Timing: publish_projected_goal_marker=%ld ms",
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            marker_end - marker_start)
+                            .count());
+          }
+
+          RCLCPP_INFO(this->get_logger(),
+                      "Published projected subgoal: (%f, %f) (distance: %f)",
+                      subgoal.x, subgoal.y, projection_result.dist);
+          RCLCPP_INFO(this->get_logger(),
+                      "Timing: GetNextSubgoal=%ld ms, polydist=%ld ms",
+                      std::chrono::duration_cast<std::chrono::milliseconds>(
+                          get_subgoal_end - get_subgoal_start)
+                          .count(),
+                      std::chrono::duration_cast<std::chrono::milliseconds>(
+                          project_end - project_start)
+                          .count());
+        } else {
+          RCLCPP_WARN(this->get_logger(), "No valid subgoal found");
+          return;
+        }
       }
+      current_subgoal_pub_->publish(subgoal);
+
+      // Publish subgoal marker for visualization
+      publish_subgoal_marker(subgoal);
+
+      last_subgoal_ = subgoal;
+      last_subgoal_valid_ = true;
+      new_subgoal_requested_ = false;
+      if (goal_received_ && !preference_order_.empty()) {
+        preference_index_ =
+            (preference_index_ + 1) % preference_order_.size();
+      }
+    } else {
+      RCLCPP_INFO(this->get_logger(),
+                  "Map update received; keeping current subgoal until reached");
     }
     const auto subgoal_end = std::chrono::steady_clock::now();
-
-    current_subgoal_pub_->publish(subgoal);
-
-    // Publish subgoal marker for visualization
-    publish_subgoal_marker(subgoal);
-
-    last_subgoal_ = subgoal;
-    last_subgoal_valid_ = true;
-    if (goal_received_ && !preference_order_.empty()) {
-      preference_index_ =
-          (preference_index_ + 1) % preference_order_.size();
-    }
 
     const auto process_end = std::chrono::steady_clock::now();
     RCLCPP_INFO(this->get_logger(),

@@ -26,3 +26,7 @@ safe_bayesian_optimization_node:
       update_rate: 10.0  # Hz
       log_level: "info"
       enable_visualization: true
+
+goal_point_publisher:
+  ros__parameters:
+    exploration_mode: false

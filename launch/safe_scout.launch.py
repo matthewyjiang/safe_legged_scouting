@@ -64,6 +64,7 @@ def generate_launch_description():
              package='safe_bayesian_optimization',
              executable='goal_point_publisher',
              name='goal_point_publisher',
+             parameters=[LaunchConfiguration('config_file')],
              output='screen'
              ),
          Node(
