@@ -43,6 +43,7 @@ public:
     this->declare_parameter("angular_cmd_limit", 1.0);
     this->declare_parameter("goal_tolerance", 0.1);
     this->declare_parameter("next_subgoal_tolerance", 0.1);
+    this->declare_parameter("simplify_tolerance", 0.2);
 
     // Read parameters and configure diffeomorphism parameters
     double p = this->get_parameter("p").as_double();
@@ -58,6 +59,7 @@ public:
     goal_tolerance_ = this->get_parameter("goal_tolerance").as_double();
     next_subgoal_tolerance_ =
         this->get_parameter("next_subgoal_tolerance").as_double();
+    simplify_tolerance_ = this->get_parameter("simplify_tolerance").as_double();
 
     // Set default workspace (will be updated when envelope is received)
     std::vector<std::vector<double>> default_workspace = {
@@ -207,6 +209,7 @@ private:
   double angular_cmd_limit_;
   double goal_tolerance_;
   double next_subgoal_tolerance_;
+  double simplify_tolerance_;
   std::vector<polygon> obstacle_polygons_;
   std::vector<std::vector<PolygonClass>> diffeo_tree_array_;
 
@@ -219,6 +222,8 @@ private:
   geometry_msgs::msg::Point current_subgoal_;
   bool has_subgoal_ = false;
   bool subgoal_reached_ = false;
+  rclcpp::Time last_subgoal_reached_pub_time_;
+  bool last_subgoal_reached_pub_valid_ = false;
   double env_x_min_ = 0.0;
   double env_x_max_ = 0.0;
   double env_y_min_ = 0.0;
@@ -276,8 +281,25 @@ private:
     std::vector<polygon> polygon_list_merged;
     for (size_t i = 0; i < output_union.size(); i++) {
       polygon simplified_component;
-      bg::simplify(output_union[i], simplified_component, 0.2);
-      polygon_list_merged.push_back(simplified_component);
+      bg::simplify(output_union[i], simplified_component, simplify_tolerance_);
+
+      multi_polygon conservative_result;
+      bg::intersection(simplified_component, output_union[i],
+                       conservative_result);
+      if (!conservative_result.empty()) {
+        double max_area = 0.0;
+        size_t best_idx = 0;
+        for (size_t j = 0; j < conservative_result.size(); ++j) {
+          double area = bg::area(conservative_result[j]);
+          if (area > max_area) {
+            max_area = area;
+            best_idx = j;
+          }
+        }
+        polygon_list_merged.push_back(conservative_result[best_idx]);
+      } else {
+        polygon_list_merged.push_back(output_union[i]);
+      }
     }
 
     return polygon_list_merged;
@@ -473,6 +495,7 @@ private:
     current_subgoal_ = *msg;
     has_subgoal_ = true;
     subgoal_reached_ = false;
+    last_subgoal_reached_pub_valid_ = false;
 
     RCLCPP_INFO(this->get_logger(), "Received subgoal: x=%.3f, y=%.3f, z=%.3f",
                 current_subgoal_.x, current_subgoal_.y, current_subgoal_.z);
@@ -655,14 +678,35 @@ private:
         sqrt(pow(current_subgoal_.x - current_position_.x, 2) +
              pow(current_subgoal_.y - current_position_.y, 2));
 
+    const auto now = this->get_clock()->now();
+    const auto subgoal_reached_repeat_period =
+        rclcpp::Duration::from_seconds(1.0);
+    const auto publish_subgoal_reached = [&]() {
+      subgoal_reached_pub_->publish(std_msgs::msg::Empty());
+      last_subgoal_reached_pub_time_ = now;
+      last_subgoal_reached_pub_valid_ = true;
+    };
+
     if (distance_to_subgoal <= next_subgoal_tolerance_) {
+      bool should_publish = false;
       if (!subgoal_reached_) {
-        subgoal_reached_pub_->publish(std_msgs::msg::Empty());
         subgoal_reached_ = true;
+        should_publish = true;
+      } else if (!last_subgoal_reached_pub_valid_ ||
+                 (now - last_subgoal_reached_pub_time_) >=
+                     subgoal_reached_repeat_period) {
+        should_publish = true;
+      }
+      if (should_publish) {
+        publish_subgoal_reached();
       }
     }
 
     if (distance_to_subgoal <= goal_tolerance_) {
+      if (!subgoal_reached_) {
+        subgoal_reached_ = true;
+        publish_subgoal_reached();
+      }
       // Robot is within goal tolerance, stop movement
       cmd_vel.linear.x = 0.0;
       cmd_vel.linear.y = 0.0;

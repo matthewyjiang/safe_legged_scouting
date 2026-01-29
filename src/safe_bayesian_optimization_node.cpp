@@ -151,6 +151,7 @@ public:
     goal_received_ = false;
     last_subgoal_valid_ = false;
     new_subgoal_requested_ = false;
+    has_terrain_map_ = false;
     has_robot_pose_ = false;
     confidence_initialized_ = false;
     safe_set_initialized_ = false;
@@ -220,6 +221,7 @@ private:
   geometry_msgs::msg::Point last_subgoal_;
   bool last_subgoal_valid_;
   bool new_subgoal_requested_;
+  bool has_terrain_map_;
   geometry_msgs::msg::Point current_robot_position_;
   bool has_robot_pose_;
   enum class PreferenceMetric { Goal, Last, Expansion };
@@ -625,60 +627,6 @@ private:
     }
     const auto frontier_extract_end = std::chrono::steady_clock::now();
 
-    if (!goal_received_) {
-      const auto no_goal_start = std::chrono::steady_clock::now();
-      double best_confidence_width = -1.0;
-      int best_index = -1;
-
-      for (size_t i = 0; i < num_frontiers; ++i) {
-        double conf_width = frontier_confidence_width(i);
-
-        if (conf_width > best_confidence_width) {
-          best_confidence_width = conf_width;
-          best_index = static_cast<int>(i);
-        }
-      }
-
-      if (best_index < 0) {
-        RCLCPP_WARN(this->get_logger(),
-                    "Failed to select frontier point by uncertainty");
-        return -1;
-      }
-
-      const auto no_goal_end = std::chrono::steady_clock::now();
-      RCLCPP_INFO(this->get_logger(),
-                  "Timing(GetNextSubgoal): safety_image=%ld ms, "
-                  "connected=%ld ms, candidates=%ld ms, extract=%ld ms, "
-                  "no_goal_select=%ld ms, total=%ld ms",
-                  std::chrono::duration_cast<std::chrono::milliseconds>(
-                      safety_image_end - safety_image_start)
-                      .count(),
-                  std::chrono::duration_cast<std::chrono::milliseconds>(
-                      connected_end - connected_start)
-                      .count(),
-                  std::chrono::duration_cast<std::chrono::milliseconds>(
-                      candidate_end - candidate_start)
-                      .count(),
-                  std::chrono::duration_cast<std::chrono::milliseconds>(
-                      frontier_extract_end - frontier_extract_start)
-                      .count(),
-                  std::chrono::duration_cast<std::chrono::milliseconds>(
-                      no_goal_end - no_goal_start)
-                      .count(),
-                  std::chrono::duration_cast<std::chrono::milliseconds>(
-                      no_goal_end - start)
-                      .count());
-      return candidate_indices[best_index];
-    }
-
-    const auto goal_scores_start = std::chrono::steady_clock::now();
-    const Eigen::VectorXd goal_eigen =
-        (Eigen::VectorXd(2) << current_goal_.point.x, current_goal_.point.y)
-            .finished();
-    const Eigen::VectorXd goal_distances =
-        (frontier_points.rowwise() - goal_eigen.transpose()).rowwise().norm();
-    const Eigen::VectorXd goal_scores = (1.0 / (1.0 + goal_distances.array())).matrix();
-
     Eigen::VectorXd prev_subgoal_distances(num_frontiers);
     if (last_subgoal_valid_) {
       const Eigen::VectorXd prev_subgoal_eigen =
@@ -693,6 +641,20 @@ private:
     }
     const Eigen::VectorXd prev_subgoal_scores =
         (1.0 / (1.0 + prev_subgoal_distances.array())).matrix();
+
+    const auto goal_scores_start = std::chrono::steady_clock::now();
+    Eigen::VectorXd goal_scores(num_frontiers);
+    if (goal_received_) {
+      const Eigen::VectorXd goal_eigen =
+          (Eigen::VectorXd(2) << current_goal_.point.x, current_goal_.point.y)
+              .finished();
+      const Eigen::VectorXd goal_distances =
+          (frontier_points.rowwise() - goal_eigen.transpose()).rowwise().norm();
+      goal_scores =
+          (1.0 / (1.0 + goal_distances.array())).matrix();
+    } else {
+      goal_scores.setZero();
+    }
 
     const auto expansion_start = std::chrono::steady_clock::now();
     Eigen::VectorXi expansion_scores =
@@ -786,16 +748,26 @@ private:
       candidates.push_back(candidate);
     }
 
-    std::sort(candidates.begin(), candidates.end(),
-              [](const CandidateScore &a, const CandidateScore &b) {
-                if (a.goal_score != b.goal_score) {
-                  return a.goal_score > b.goal_score;
-                }
-                if (a.prev_score != b.prev_score) {
-                  return a.prev_score > b.prev_score;
-                }
-                return a.expansion_score > b.expansion_score;
-              });
+    if (goal_received_) {
+      std::sort(candidates.begin(), candidates.end(),
+                [](const CandidateScore &a, const CandidateScore &b) {
+                  if (a.goal_score != b.goal_score) {
+                    return a.goal_score > b.goal_score;
+                  }
+                  if (a.prev_score != b.prev_score) {
+                    return a.prev_score > b.prev_score;
+                  }
+                  return a.expansion_score > b.expansion_score;
+                });
+    } else {
+      std::sort(candidates.begin(), candidates.end(),
+                [](const CandidateScore &a, const CandidateScore &b) {
+                  if (a.prev_score != b.prev_score) {
+                    return a.prev_score > b.prev_score;
+                  }
+                  return a.expansion_score > b.expansion_score;
+                });
+    }
 
     std::map<double, CandidateScore> frontier_2d;
 
@@ -829,31 +801,35 @@ private:
   }
     const auto pareto_end = std::chrono::steady_clock::now();
 
-    if (preference_order_.empty()) {
-      RCLCPP_WARN(this->get_logger(),
-                  "Preference order is empty; using goal score.");
-      preference_order_ = {PreferenceMetric::Goal};
-      preference_index_ = 0;
-    }
+    PreferenceMetric preference = PreferenceMetric::Expansion;
+    const char *preference_name = "expansion";
+    if (goal_received_) {
+      if (preference_order_.empty()) {
+        RCLCPP_WARN(this->get_logger(),
+                    "Preference order is empty; using goal score.");
+        preference_order_ = {PreferenceMetric::Goal};
+        preference_index_ = 0;
+      }
 
-    const PreferenceMetric preference =
-        preference_order_[preference_index_ % preference_order_.size()];
-    const char *preference_name = "unknown";
-    switch (preference) {
-    case PreferenceMetric::Goal:
-      preference_name = "goal";
-      break;
-    case PreferenceMetric::Last:
-      preference_name = "last";
-      break;
-    case PreferenceMetric::Expansion:
-      preference_name = "expansion";
-      break;
+      preference =
+          preference_order_[preference_index_ % preference_order_.size()];
+      preference_name = "unknown";
+      switch (preference) {
+      case PreferenceMetric::Goal:
+        preference_name = "goal";
+        break;
+      case PreferenceMetric::Last:
+        preference_name = "last";
+        break;
+      case PreferenceMetric::Expansion:
+        preference_name = "expansion";
+        break;
+      }
+      preference_index_ =
+          (preference_index_ + 1) % preference_order_.size();
     }
     RCLCPP_INFO(this->get_logger(),
                 "Selecting subgoal using preference: %s", preference_name);
-    preference_index_ =
-        (preference_index_ + 1) % preference_order_.size();
 
     const auto preference_start = std::chrono::steady_clock::now();
     const CandidateScore *best = nullptr;
@@ -963,8 +939,7 @@ private:
       
       last_spatial_data_size_ = current_size;
       
-      // Request terrain map when size changes
-      request_terrain_map();
+      // Defer terrain map updates until the subgoal is reached.
     }
   }
 
@@ -1042,6 +1017,7 @@ private:
                                 GetTerrainMapWithUncertainty::Response>
           response) {
     const auto process_start = std::chrono::steady_clock::now();
+    has_terrain_map_ = true;
 
     // Update the parameter set D_, mean mu_, and std_ with the new terrain map
     // data
@@ -1091,7 +1067,7 @@ private:
       } else {
         if (!goal_received_) {
           RCLCPP_INFO(this->get_logger(),
-                      "No goal available; selecting frontier with highest uncertainty");
+                      "No goal available; selecting frontier using pareto exploration");
         }
         const auto get_subgoal_start = std::chrono::steady_clock::now();
         // Goal is not safe, find frontier subgoal and project it
@@ -1958,12 +1934,18 @@ private:
     current_goal_.point = msg->point;
     goal_received_ = true;
 
-    RCLCPP_INFO(this->get_logger(),
-                "New goal received: (%.2f, %.2f), requesting terrain map update",
-                msg->point.x, msg->point.y);
+    new_subgoal_requested_ = true;
 
-    // Request terrain map to recompute subgoal with new goal
-    request_terrain_map();
+    if (!has_terrain_map_) {
+      RCLCPP_INFO(this->get_logger(),
+                  "New goal received: (%.2f, %.2f), requesting initial terrain map",
+                  msg->point.x, msg->point.y);
+      request_terrain_map();
+    } else {
+      RCLCPP_INFO(this->get_logger(),
+                  "New goal received: (%.2f, %.2f), deferring terrain map update",
+                  msg->point.x, msg->point.y);
+    }
   }
 
   void publish_subgoal_marker(const geometry_msgs::msg::Point &subgoal) {
