@@ -58,6 +58,9 @@ public:
     this->declare_parameter("opt.subgoal_erosion", 0.2);
     this->declare_parameter("opt.preference_order",
                             std::vector<std::string>{"g", "l", "e"});
+    this->declare_parameter("opt.update_on_measurement", false);
+    this->declare_parameter("opt.expansion_score_k", 1.0);
+    this->declare_parameter("opt.goal_score_k", 1.0);
     this->declare_parameter("robot.radius", 0.5);
     this->declare_parameter("robot.pose_topic", "spirit/current_pose");
     this->declare_parameter("polygon.simplification_tolerance", 0.1);
@@ -81,6 +84,9 @@ public:
     subgoal_erosion_ = this->get_parameter("opt.subgoal_erosion").as_double();
     auto preference_order_param =
         this->get_parameter("opt.preference_order").as_string_array();
+    update_on_measurement_ = this->get_parameter("opt.update_on_measurement").as_bool();
+    expansion_score_k_ = this->get_parameter("opt.expansion_score_k").as_double();
+    goal_score_k_ = this->get_parameter("opt.goal_score_k").as_double();
     robot_radius_ = this->get_parameter("robot.radius").as_double();
     auto robot_pose_topic =
         this->get_parameter("robot.pose_topic").as_string();
@@ -138,6 +144,17 @@ public:
         this->create_publisher<visualization_msgs::msg::Marker>(
             "/projected_goal_marker", 10);
 
+    // Create frontier visualization marker array publishers
+    frontier_goal_score_markers_pub_ =
+        this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            "/frontier_goal_score_markers", 10);
+    frontier_expansion_prob_markers_pub_ =
+        this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            "/frontier_expansion_prob_markers", 10);
+    frontier_overall_score_markers_pub_ =
+        this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            "/frontier_overall_score_markers", 10);
+
     // Only create debug image publisher if enabled
     if (publish_debug_image_) {
       debug_image_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
@@ -181,8 +198,21 @@ private:
   double f_max_;
   double lipschitz_L_;
   double subgoal_erosion_;
+  bool update_on_measurement_;
+  double expansion_score_k_;
+  double goal_score_k_;
   double robot_radius_;
   double simplification_tolerance_;
+
+  // Candidate score structure for frontier evaluation
+  struct CandidateScore {
+    double goal_score;
+    double prev_score;
+    double expansion_score;
+    double prob_expansion;
+    int frontier_idx;
+    int data_idx;
+  };
 
   // Spatial data monitoring
   rclcpp::Client<trusses_custom_interfaces::srv::GetTerrainMapWithUncertainty>::
@@ -204,6 +234,12 @@ private:
       concave_markers_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr
       projected_goal_marker_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
+      frontier_goal_score_markers_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
+      frontier_expansion_prob_markers_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
+      frontier_overall_score_markers_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr debug_image_pub_;
 
   // Parameters from config
@@ -639,8 +675,6 @@ private:
       prev_subgoal_distances.setConstant(
           std::numeric_limits<double>::infinity());
     }
-    const Eigen::VectorXd prev_subgoal_scores =
-        (1.0 / (1.0 + prev_subgoal_distances.array())).matrix();
 
     const auto goal_scores_start = std::chrono::steady_clock::now();
     Eigen::VectorXd goal_scores(num_frontiers);
@@ -650,10 +684,11 @@ private:
               .finished();
       const Eigen::VectorXd goal_distances =
           (frontier_points.rowwise() - goal_eigen.transpose()).rowwise().norm();
-      goal_scores =
-          (1.0 / (1.0 + goal_distances.array())).matrix();
+      // goal_score = exp(-goal_score_k * (goal_distance + prev_subgoal_distance))
+      goal_scores = (-goal_score_k_ * (goal_distances.array() + prev_subgoal_distances.array())).exp().matrix();
     } else {
-      goal_scores.setZero();
+      // If no goal, use prev_subgoal_distance only: goal_score = exp(-goal_score_k * prev_subgoal_distance)
+      goal_scores = (-goal_score_k_ * prev_subgoal_distances.array()).exp().matrix();
     }
 
     const auto expansion_start = std::chrono::steady_clock::now();
@@ -727,22 +762,28 @@ private:
     }
     const auto expansion_end = std::chrono::steady_clock::now();
 
-    struct CandidateScore {
-      double goal_score;
-      double prev_score;
-      double expansion_score;
-      int frontier_idx;
-      int data_idx;
+    // Helper function for sigmoid: maps expansion_score to [0,1] using k parameter
+    // prob_expansion = 1 - exp(-k * expansion_score)
+    // When expansion_score = 0: prob_expansion = 0
+    // Higher k = faster approach to 1.0
+    auto compute_prob_expansion = [this](double expansion_score) -> double {
+      if (expansion_score <= 0.0) {
+        return 0.0;
+      }
+      return 1.0 - std::exp(-expansion_score_k_ * expansion_score);
     };
 
     const auto pareto_start = std::chrono::steady_clock::now();
     std::vector<CandidateScore> candidates;
     candidates.reserve(num_frontiers);
     for (size_t i = 0; i < num_frontiers; ++i) {
+      double exp_score = static_cast<double>(expansion_scores(static_cast<int>(i)));
+      double prob_exp = compute_prob_expansion(exp_score);
       CandidateScore candidate{
           goal_scores(static_cast<int>(i)),
-          prev_subgoal_scores(static_cast<int>(i)),
-          static_cast<double>(expansion_scores(static_cast<int>(i))),
+          0.0,  // prev_score no longer used
+          exp_score,
+          prob_exp,
           static_cast<int>(i),
           candidate_indices[i]};
       candidates.push_back(candidate);
@@ -754,17 +795,11 @@ private:
                   if (a.goal_score != b.goal_score) {
                     return a.goal_score > b.goal_score;
                   }
-                  if (a.prev_score != b.prev_score) {
-                    return a.prev_score > b.prev_score;
-                  }
                   return a.expansion_score > b.expansion_score;
                 });
     } else {
       std::sort(candidates.begin(), candidates.end(),
                 [](const CandidateScore &a, const CandidateScore &b) {
-                  if (a.prev_score != b.prev_score) {
-                    return a.prev_score > b.prev_score;
-                  }
                   return a.expansion_score > b.expansion_score;
                 });
     }
@@ -772,7 +807,9 @@ private:
     std::map<double, CandidateScore> frontier_2d;
 
     for (const auto &candidate : candidates) {
-      auto it = frontier_2d.lower_bound(candidate.prev_score);
+      // Use goal_score as key if goal exists, otherwise use expansion_score
+      double key = goal_received_ ? candidate.goal_score : candidate.expansion_score;
+      auto it = frontier_2d.lower_bound(key);
       if (it != frontier_2d.end() &&
           it->second.expansion_score >= candidate.expansion_score) {
         continue;
@@ -788,12 +825,12 @@ private:
       }
 
       if (it != frontier_2d.end() &&
-          it->first == candidate.prev_score &&
+          it->first == key &&
           it->second.expansion_score <= candidate.expansion_score) {
         frontier_2d.erase(it);
       }
 
-      frontier_2d.emplace(candidate.prev_score, candidate);
+      frontier_2d.emplace(key, candidate);
     }
 
     if (frontier_2d.empty()) {
@@ -842,7 +879,7 @@ private:
         metric_value = candidate.goal_score;
         break;
       case PreferenceMetric::Last:
-        metric_value = candidate.prev_score;
+        metric_value = candidate.expansion_score;  // Use expansion_score instead of prev_score
         break;
       case PreferenceMetric::Expansion:
         metric_value = candidate.expansion_score;
@@ -925,6 +962,11 @@ private:
                     preference_end - start)
                     .count());
 
+    // Publish frontier markers for visualization (3 separate topics)
+    publish_frontier_goal_score_markers(candidates, frontier_points);
+    publish_frontier_expansion_prob_markers(candidates, frontier_points);
+    publish_frontier_overall_score_markers(candidates, frontier_points);
+
     return best->data_idx;
   }
 
@@ -939,7 +981,19 @@ private:
       
       last_spatial_data_size_ = current_size;
       
-      // Defer terrain map updates until the subgoal is reached.
+      // Update terrain map if update_on_measurement is enabled
+      if (update_on_measurement_) {
+        RCLCPP_INFO(this->get_logger(),
+                    "Update on measurement enabled; requesting terrain map update");
+        // When updating on measurement, also re-evaluate subgoal in case it became invalid
+        // This ensures the subgoal stays valid as the safe region updates
+        new_subgoal_requested_ = true;
+        request_terrain_map();
+      } else {
+        // Defer terrain map updates until the subgoal is reached.
+        RCLCPP_DEBUG(this->get_logger(),
+                     "Update on measurement disabled; deferring terrain map update until subgoal reached");
+      }
     }
   }
 
@@ -1038,8 +1092,14 @@ private:
 
     const auto compute_sets_start = std::chrono::steady_clock::now();
     // Recompute sets with new data
+    RCLCPP_INFO(this->get_logger(), 
+                "Updating safe set with %zu data points (update_on_measurement=%s)",
+                num_points, update_on_measurement_ ? "true" : "false");
     ComputeSets();
     const auto compute_sets_end = std::chrono::steady_clock::now();
+    int safe_count = S_.count();
+    RCLCPP_INFO(this->get_logger(), 
+                "Safe set updated: %d/%zu points are safe", safe_count, num_points);
 
     const auto publish_polygons_start = std::chrono::steady_clock::now();
     publish_obstacle_polygons();
@@ -2194,6 +2254,156 @@ private:
     // Small delay to ensure line is published first
     rclcpp::sleep_for(std::chrono::milliseconds(10));
     projected_goal_marker_pub_->publish(arrow_marker);
+  }
+
+  // Helper function to map value to color (yellow = high, green = low)
+  void value_to_color(double normalized_value, float &r, float &g, float &b) {
+    // Normalized value should be in [0, 1]
+    // Black (low, value=0.0) -> White (high, value=1.0)
+    // Clamp to [0, 1]
+    normalized_value = std::clamp(normalized_value, 0.0, 1.0);
+    
+    // Linear interpolation: black (0,0,0) to white (1,1,1)
+    r = normalized_value;      // Red: 0.0 at low, 1.0 at high
+    g = normalized_value;       // Green: 0.0 at low, 1.0 at high
+    b = normalized_value;       // Blue: 0.0 at low, 1.0 at high
+  }
+
+  void publish_frontier_goal_score_markers(
+      const std::vector<CandidateScore> &candidates,
+      const Eigen::MatrixXd &frontier_points) {
+    visualization_msgs::msg::MarkerArray marker_array;
+
+    // Find min/max goal_score for normalization
+    double min_val = std::numeric_limits<double>::max();
+    double max_val = std::numeric_limits<double>::lowest();
+    for (const auto &candidate : candidates) {
+      if (candidate.goal_score < min_val) min_val = candidate.goal_score;
+      if (candidate.goal_score > max_val) max_val = candidate.goal_score;
+    }
+    double range = std::max(max_val - min_val, 1e-9);
+
+    int marker_id = 0;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      const auto &candidate = candidates[i];
+      double normalized = (candidate.goal_score - min_val) / range;
+
+      visualization_msgs::msg::Marker marker;
+      marker.header.frame_id = "map";
+      marker.header.stamp = this->get_clock()->now();
+      marker.ns = "frontier_goal_score";
+      marker.id = marker_id++;
+      marker.type = visualization_msgs::msg::Marker::SPHERE;
+      marker.action = visualization_msgs::msg::Marker::ADD;
+
+      marker.pose.position.x = frontier_points(i, 0);
+      marker.pose.position.y = frontier_points(i, 1);
+      marker.pose.position.z = 0.0;
+      marker.pose.orientation.w = 1.0;
+
+      marker.scale.x = 0.2;
+      marker.scale.y = 0.2;
+      marker.scale.z = 0.2;
+
+      value_to_color(normalized, marker.color.r, marker.color.g, marker.color.b);
+      marker.color.a = 0.8;
+
+      marker_array.markers.push_back(marker);
+    }
+
+    frontier_goal_score_markers_pub_->publish(marker_array);
+  }
+
+  void publish_frontier_expansion_prob_markers(
+      const std::vector<CandidateScore> &candidates,
+      const Eigen::MatrixXd &frontier_points) {
+    visualization_msgs::msg::MarkerArray marker_array;
+
+    // Find min/max prob_expansion for normalization
+    double min_val = std::numeric_limits<double>::max();
+    double max_val = std::numeric_limits<double>::lowest();
+    for (const auto &candidate : candidates) {
+      if (candidate.prob_expansion < min_val) min_val = candidate.prob_expansion;
+      if (candidate.prob_expansion > max_val) max_val = candidate.prob_expansion;
+    }
+    double range = std::max(max_val - min_val, 1e-9);
+
+    int marker_id = 0;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      const auto &candidate = candidates[i];
+      double normalized = (candidate.prob_expansion - min_val) / range;
+
+      visualization_msgs::msg::Marker marker;
+      marker.header.frame_id = "map";
+      marker.header.stamp = this->get_clock()->now();
+      marker.ns = "frontier_expansion_prob";
+      marker.id = marker_id++;
+      marker.type = visualization_msgs::msg::Marker::SPHERE;
+      marker.action = visualization_msgs::msg::Marker::ADD;
+
+      marker.pose.position.x = frontier_points(i, 0);
+      marker.pose.position.y = frontier_points(i, 1);
+      marker.pose.position.z = 0.1;  // Slightly higher to avoid overlap
+      marker.pose.orientation.w = 1.0;
+
+      marker.scale.x = 0.2;
+      marker.scale.y = 0.2;
+      marker.scale.z = 0.2;
+
+      value_to_color(normalized, marker.color.r, marker.color.g, marker.color.b);
+      marker.color.a = 0.8;
+
+      marker_array.markers.push_back(marker);
+    }
+
+    frontier_expansion_prob_markers_pub_->publish(marker_array);
+  }
+
+  void publish_frontier_overall_score_markers(
+      const std::vector<CandidateScore> &candidates,
+      const Eigen::MatrixXd &frontier_points) {
+    visualization_msgs::msg::MarkerArray marker_array;
+
+    // Compute overall_score = prob_expansion * goal_score
+    std::vector<double> overall_scores;
+    overall_scores.reserve(candidates.size());
+    for (const auto &candidate : candidates) {
+      overall_scores.push_back(candidate.prob_expansion * candidate.goal_score);
+    }
+
+    // Find min/max overall_score for normalization
+    double min_val = *std::min_element(overall_scores.begin(), overall_scores.end());
+    double max_val = *std::max_element(overall_scores.begin(), overall_scores.end());
+    double range = std::max(max_val - min_val, 1e-9);
+
+    int marker_id = 0;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      double normalized = (overall_scores[i] - min_val) / range;
+
+      visualization_msgs::msg::Marker marker;
+      marker.header.frame_id = "map";
+      marker.header.stamp = this->get_clock()->now();
+      marker.ns = "frontier_overall_score";
+      marker.id = marker_id++;
+      marker.type = visualization_msgs::msg::Marker::SPHERE;
+      marker.action = visualization_msgs::msg::Marker::ADD;
+
+      marker.pose.position.x = frontier_points(i, 0);
+      marker.pose.position.y = frontier_points(i, 1);
+      marker.pose.position.z = 0.2;  // Higher to avoid overlap
+      marker.pose.orientation.w = 1.0;
+
+      marker.scale.x = 0.2;
+      marker.scale.y = 0.2;
+      marker.scale.z = 0.2;
+
+      value_to_color(normalized, marker.color.r, marker.color.g, marker.color.b);
+      marker.color.a = 0.8;
+
+      marker_array.markers.push_back(marker);
+    }
+
+    frontier_overall_score_markers_pub_->publish(marker_array);
   }
 };
 

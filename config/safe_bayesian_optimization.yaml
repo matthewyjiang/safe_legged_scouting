@@ -6,6 +6,9 @@ safe_bayesian_optimization_node:
       f_max: 500.0
       subgoal_erosion: 0.4
       preference_order: ["g", "l", "e"]
+      update_on_measurement: true  # If true, update safe region on each measurement change; if false, update only after reaching subgoal
+      expansion_score_k: 2.0  # Expansion score decay parameter: prob_expansion = 1 - exp(-k * expansion_score). Higher k = faster approach to 1.0
+      goal_score_k: 10.0  # Goal score decay parameter: goal_score = exp(-k * (goal_distance + prev_subgoal_distance)) if goal exists, else exp(-k * prev_subgoal_distance). Higher k = faster decay with distance
       
     # Terrain map request parameters
     terrain_map:
@@ -26,6 +29,13 @@ safe_bayesian_optimization_node:
       update_rate: 10.0  # Hz
       log_level: "info"
       enable_visualization: true
+      
+    # Topic whitelist for Foxglove visualization
+    visualization:
+      topic_whitelist:
+        - "/frontier_goal_score_markers"
+        - "/frontier_expansion_prob_markers"
+        - "/frontier_overall_score_markers"
 
 goal_point_publisher:
   ros__parameters:
