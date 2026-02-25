@@ -61,6 +61,7 @@ public:
     this->declare_parameter("opt.update_on_measurement", false);
     this->declare_parameter("opt.expansion_score_k", 1.0);
     this->declare_parameter("opt.goal_score_k", 1.0);
+    this->declare_parameter("opt.use_pareto_selection", false);
     this->declare_parameter("robot.radius", 0.5);
     this->declare_parameter("robot.pose_topic", "spirit/current_pose");
     this->declare_parameter("polygon.simplification_tolerance", 0.1);
@@ -87,6 +88,7 @@ public:
     update_on_measurement_ = this->get_parameter("opt.update_on_measurement").as_bool();
     expansion_score_k_ = this->get_parameter("opt.expansion_score_k").as_double();
     goal_score_k_ = this->get_parameter("opt.goal_score_k").as_double();
+    use_pareto_selection_ = this->get_parameter("opt.use_pareto_selection").as_bool();
     robot_radius_ = this->get_parameter("robot.radius").as_double();
     auto robot_pose_topic =
         this->get_parameter("robot.pose_topic").as_string();
@@ -154,6 +156,12 @@ public:
     frontier_overall_score_markers_pub_ =
         this->create_publisher<visualization_msgs::msg::MarkerArray>(
             "/frontier_overall_score_markers", 10);
+    frontier_goal_distance_markers_pub_ =
+        this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            "/frontier_goal_distance_markers", 10);
+    frontier_robot_distance_markers_pub_ =
+        this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            "/frontier_robot_distance_markers", 10);
 
     // Only create debug image publisher if enabled
     if (publish_debug_image_) {
@@ -199,6 +207,7 @@ private:
   double lipschitz_L_;
   double subgoal_erosion_;
   bool update_on_measurement_;
+  bool use_pareto_selection_;
   double expansion_score_k_;
   double goal_score_k_;
   double robot_radius_;
@@ -207,7 +216,7 @@ private:
   // Candidate score structure for frontier evaluation
   struct CandidateScore {
     double goal_score;
-    double prev_score;
+    double robot_score;
     double expansion_score;
     double prob_expansion;
     int frontier_idx;
@@ -240,6 +249,10 @@ private:
       frontier_expansion_prob_markers_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       frontier_overall_score_markers_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
+      frontier_goal_distance_markers_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
+      frontier_robot_distance_markers_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr debug_image_pub_;
 
   // Parameters from config
@@ -663,32 +676,36 @@ private:
     }
     const auto frontier_extract_end = std::chrono::steady_clock::now();
 
-    Eigen::VectorXd prev_subgoal_distances(num_frontiers);
-    if (last_subgoal_valid_) {
-      const Eigen::VectorXd prev_subgoal_eigen =
-          (Eigen::VectorXd(2) << last_subgoal_.x, last_subgoal_.y).finished();
-      prev_subgoal_distances =
-          (frontier_points.rowwise() - prev_subgoal_eigen.transpose())
-              .rowwise()
-              .norm();
-    } else {
-      prev_subgoal_distances.setConstant(
-          std::numeric_limits<double>::infinity());
-    }
+    // Robot continuity term: distance from current robot position to each
+    // candidate frontier point.
+    const Eigen::VectorXd robot_position_eigen =
+        (Eigen::VectorXd(2) << current_robot_position_.x, current_robot_position_.y)
+            .finished();
+    const Eigen::VectorXd robot_to_candidate_distances =
+        (frontier_points.rowwise() - robot_position_eigen.transpose())
+            .rowwise()
+            .norm();
+    const Eigen::VectorXd robot_scores =
+        (-goal_score_k_ * robot_to_candidate_distances.array()).exp().matrix();
 
     const auto goal_scores_start = std::chrono::steady_clock::now();
     Eigen::VectorXd goal_scores(num_frontiers);
+    Eigen::VectorXd goal_distances = Eigen::VectorXd::Zero(num_frontiers);
     if (goal_received_) {
       const Eigen::VectorXd goal_eigen =
           (Eigen::VectorXd(2) << current_goal_.point.x, current_goal_.point.y)
               .finished();
-      const Eigen::VectorXd goal_distances =
+      goal_distances =
           (frontier_points.rowwise() - goal_eigen.transpose()).rowwise().norm();
-      // goal_score = exp(-goal_score_k * (goal_distance + prev_subgoal_distance))
-      goal_scores = (-goal_score_k_ * (goal_distances.array() + prev_subgoal_distances.array())).exp().matrix();
+      // goal_score = exp(-goal_score_k * (goal_distance + robot_distance))
+      goal_scores =
+          (-goal_score_k_ *
+           (goal_distances.array() + robot_to_candidate_distances.array()))
+              .exp()
+              .matrix();
     } else {
-      // If no goal, use prev_subgoal_distance only: goal_score = exp(-goal_score_k * prev_subgoal_distance)
-      goal_scores = (-goal_score_k_ * prev_subgoal_distances.array()).exp().matrix();
+      // If no goal, use robot_distance only.
+      goal_scores = robot_scores;
     }
 
     const auto expansion_start = std::chrono::steady_clock::now();
@@ -781,7 +798,7 @@ private:
       double prob_exp = compute_prob_expansion(exp_score);
       CandidateScore candidate{
           goal_scores(static_cast<int>(i)),
-          0.0,  // prev_score no longer used
+          robot_scores(static_cast<int>(i)),
           exp_score,
           prob_exp,
           static_cast<int>(i),
@@ -789,109 +806,134 @@ private:
       candidates.push_back(candidate);
     }
 
-    if (goal_received_) {
-      std::sort(candidates.begin(), candidates.end(),
-                [](const CandidateScore &a, const CandidateScore &b) {
-                  if (a.goal_score != b.goal_score) {
-                    return a.goal_score > b.goal_score;
-                  }
-                  return a.expansion_score > b.expansion_score;
-                });
-    } else {
-      std::sort(candidates.begin(), candidates.end(),
-                [](const CandidateScore &a, const CandidateScore &b) {
-                  return a.expansion_score > b.expansion_score;
-                });
-    }
-
-    std::map<double, CandidateScore> frontier_2d;
-
-    for (const auto &candidate : candidates) {
-      // Use goal_score as key if goal exists, otherwise use expansion_score
-      double key = goal_received_ ? candidate.goal_score : candidate.expansion_score;
-      auto it = frontier_2d.lower_bound(key);
-      if (it != frontier_2d.end() &&
-          it->second.expansion_score >= candidate.expansion_score) {
-        continue;
-      }
-
-      while (it != frontier_2d.begin()) {
-        auto prev = std::prev(it);
-        if (prev->second.expansion_score <= candidate.expansion_score) {
-          frontier_2d.erase(prev);
-        } else {
-          break;
-        }
-      }
-
-      if (it != frontier_2d.end() &&
-          it->first == key &&
-          it->second.expansion_score <= candidate.expansion_score) {
-        frontier_2d.erase(it);
-      }
-
-      frontier_2d.emplace(key, candidate);
-    }
-
-    if (frontier_2d.empty()) {
-    return candidate_indices.front();
-  }
-    const auto pareto_end = std::chrono::steady_clock::now();
-
-    PreferenceMetric preference = PreferenceMetric::Expansion;
-    const char *preference_name = "expansion";
-    if (goal_received_) {
-      if (preference_order_.empty()) {
-        RCLCPP_WARN(this->get_logger(),
-                    "Preference order is empty; using goal score.");
-        preference_order_ = {PreferenceMetric::Goal};
-        preference_index_ = 0;
-      }
-
-      preference =
-          preference_order_[preference_index_ % preference_order_.size()];
-      preference_name = "unknown";
-      switch (preference) {
-      case PreferenceMetric::Goal:
-        preference_name = "goal";
-        break;
-      case PreferenceMetric::Last:
-        preference_name = "last";
-        break;
-      case PreferenceMetric::Expansion:
-        preference_name = "expansion";
-        break;
-      }
-      preference_index_ =
-          (preference_index_ + 1) % preference_order_.size();
-    }
-    RCLCPP_INFO(this->get_logger(),
-                "Selecting subgoal using preference: %s", preference_name);
-
-    const auto preference_start = std::chrono::steady_clock::now();
+    const char *selection_strategy =
+        use_pareto_selection_ ? "pareto_preference" : "max_overall";
     const CandidateScore *best = nullptr;
     double best_metric = -std::numeric_limits<double>::infinity();
-    for (const auto &entry : frontier_2d) {
-      const CandidateScore &candidate = entry.second;
-      double metric_value = 0.0;
-      switch (preference) {
-      case PreferenceMetric::Goal:
-        metric_value = candidate.goal_score;
-        break;
-      case PreferenceMetric::Last:
-        metric_value = candidate.expansion_score;  // Use expansion_score instead of prev_score
-        break;
-      case PreferenceMetric::Expansion:
-        metric_value = candidate.expansion_score;
-        break;
+    auto pareto_end = pareto_start;
+    auto preference_start = pareto_start;
+    auto preference_end = pareto_start;
+
+    if (use_pareto_selection_) {
+      if (goal_received_) {
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const CandidateScore &a, const CandidateScore &b) {
+                    if (a.goal_score != b.goal_score) {
+                      return a.goal_score > b.goal_score;
+                    }
+                    return a.expansion_score > b.expansion_score;
+                  });
+      } else {
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const CandidateScore &a, const CandidateScore &b) {
+                    return a.expansion_score > b.expansion_score;
+                  });
       }
 
-      if (!best || metric_value > best_metric) {
-        best = &candidate;
-        best_metric = metric_value;
+      std::map<double, CandidateScore> frontier_2d;
+
+      for (const auto &candidate : candidates) {
+        // Use goal_score as key if goal exists, otherwise use expansion_score.
+        double key =
+            goal_received_ ? candidate.goal_score : candidate.expansion_score;
+        auto it = frontier_2d.lower_bound(key);
+        if (it != frontier_2d.end() &&
+            it->second.expansion_score >= candidate.expansion_score) {
+          continue;
+        }
+
+        while (it != frontier_2d.begin()) {
+          auto prev = std::prev(it);
+          if (prev->second.expansion_score <= candidate.expansion_score) {
+            frontier_2d.erase(prev);
+          } else {
+            break;
+          }
+        }
+
+        if (it != frontier_2d.end() &&
+            it->first == key &&
+            it->second.expansion_score <= candidate.expansion_score) {
+          frontier_2d.erase(it);
+        }
+
+        frontier_2d.emplace(key, candidate);
       }
+
+      if (frontier_2d.empty()) {
+        return candidate_indices.front();
+      }
+      pareto_end = std::chrono::steady_clock::now();
+
+      PreferenceMetric preference = PreferenceMetric::Expansion;
+      const char *preference_name = "expansion";
+      if (goal_received_) {
+        if (preference_order_.empty()) {
+          RCLCPP_WARN(this->get_logger(),
+                      "Preference order is empty; using goal score.");
+          preference_order_ = {PreferenceMetric::Goal};
+          preference_index_ = 0;
+        }
+
+        preference =
+            preference_order_[preference_index_ % preference_order_.size()];
+        preference_name = "unknown";
+        switch (preference) {
+        case PreferenceMetric::Goal:
+          preference_name = "goal";
+          break;
+        case PreferenceMetric::Last:
+          preference_name = "last(robot_continuity)";
+          break;
+        case PreferenceMetric::Expansion:
+          preference_name = "expansion";
+          break;
+        }
+        preference_index_ =
+            (preference_index_ + 1) % preference_order_.size();
+      }
+      RCLCPP_INFO(this->get_logger(),
+                  "Selecting subgoal using strategy: %s, preference: %s",
+                  selection_strategy, preference_name);
+
+      preference_start = std::chrono::steady_clock::now();
+      for (const auto &entry : frontier_2d) {
+        const CandidateScore &candidate = entry.second;
+        double metric_value = 0.0;
+        switch (preference) {
+        case PreferenceMetric::Goal:
+          metric_value = candidate.goal_score;
+          break;
+        case PreferenceMetric::Last:
+          metric_value = candidate.robot_score;
+          break;
+        case PreferenceMetric::Expansion:
+          metric_value = candidate.expansion_score;
+          break;
+        }
+
+        if (!best || metric_value > best_metric) {
+          best = &candidate;
+          best_metric = metric_value;
+        }
+      }
+      preference_end = std::chrono::steady_clock::now();
+    } else {
+      pareto_end = std::chrono::steady_clock::now();
+      preference_start = pareto_end;
+      for (const auto &candidate : candidates) {
+        const double overall_score = candidate.goal_score * candidate.prob_expansion;
+        if (!best || overall_score > best_metric) {
+          best = &candidate;
+          best_metric = overall_score;
+        }
+      }
+      preference_end = std::chrono::steady_clock::now();
+      RCLCPP_INFO(this->get_logger(),
+                  "Selecting subgoal using strategy: %s (overall_score = "
+                  "goal_score * prob_expansion)",
+                  selection_strategy);
     }
-    const auto preference_end = std::chrono::steady_clock::now();
 
     if (!best) {
       RCLCPP_INFO(this->get_logger(),
@@ -962,10 +1004,14 @@ private:
                     preference_end - start)
                     .count());
 
-    // Publish frontier markers for visualization (3 separate topics)
+    // Publish frontier markers for visualization.
     publish_frontier_goal_score_markers(candidates, frontier_points);
     publish_frontier_expansion_prob_markers(candidates, frontier_points);
     publish_frontier_overall_score_markers(candidates, frontier_points);
+    publish_frontier_goal_distance_markers(goal_distances, frontier_points,
+                                           goal_received_);
+    publish_frontier_robot_distance_markers(robot_to_candidate_distances,
+                                            frontier_points);
 
     return best->data_idx;
   }
@@ -2287,6 +2333,10 @@ private:
     for (size_t i = 0; i < candidates.size(); ++i) {
       const auto &candidate = candidates[i];
       double normalized = (candidate.goal_score - min_val) / range;
+      const int frontier_idx = candidate.frontier_idx;
+      if (frontier_idx < 0 || frontier_idx >= frontier_points.rows()) {
+        continue;
+      }
 
       visualization_msgs::msg::Marker marker;
       marker.header.frame_id = "map";
@@ -2296,17 +2346,17 @@ private:
       marker.type = visualization_msgs::msg::Marker::SPHERE;
       marker.action = visualization_msgs::msg::Marker::ADD;
 
-      marker.pose.position.x = frontier_points(i, 0);
-      marker.pose.position.y = frontier_points(i, 1);
+      marker.pose.position.x = frontier_points(frontier_idx, 0);
+      marker.pose.position.y = frontier_points(frontier_idx, 1);
       marker.pose.position.z = 0.0;
       marker.pose.orientation.w = 1.0;
 
-      marker.scale.x = 0.2;
-      marker.scale.y = 0.2;
-      marker.scale.z = 0.2;
+      marker.scale.x = 0.1;
+      marker.scale.y = 0.1;
+      marker.scale.z = 0.1;
 
       value_to_color(normalized, marker.color.r, marker.color.g, marker.color.b);
-      marker.color.a = 0.8;
+      marker.color.a = 1.0;
 
       marker_array.markers.push_back(marker);
     }
@@ -2332,6 +2382,10 @@ private:
     for (size_t i = 0; i < candidates.size(); ++i) {
       const auto &candidate = candidates[i];
       double normalized = (candidate.prob_expansion - min_val) / range;
+      const int frontier_idx = candidate.frontier_idx;
+      if (frontier_idx < 0 || frontier_idx >= frontier_points.rows()) {
+        continue;
+      }
 
       visualization_msgs::msg::Marker marker;
       marker.header.frame_id = "map";
@@ -2341,22 +2395,124 @@ private:
       marker.type = visualization_msgs::msg::Marker::SPHERE;
       marker.action = visualization_msgs::msg::Marker::ADD;
 
-      marker.pose.position.x = frontier_points(i, 0);
-      marker.pose.position.y = frontier_points(i, 1);
+      marker.pose.position.x = frontier_points(frontier_idx, 0);
+      marker.pose.position.y = frontier_points(frontier_idx, 1);
       marker.pose.position.z = 0.1;  // Slightly higher to avoid overlap
       marker.pose.orientation.w = 1.0;
 
-      marker.scale.x = 0.2;
-      marker.scale.y = 0.2;
-      marker.scale.z = 0.2;
+      marker.scale.x = 0.1;
+      marker.scale.y = 0.1;
+      marker.scale.z = 0.1;
 
       value_to_color(normalized, marker.color.r, marker.color.g, marker.color.b);
-      marker.color.a = 0.8;
+      marker.color.a = 1.0;
 
       marker_array.markers.push_back(marker);
     }
 
     frontier_expansion_prob_markers_pub_->publish(marker_array);
+  }
+
+  void publish_frontier_goal_distance_markers(
+      const Eigen::VectorXd &goal_distances,
+      const Eigen::MatrixXd &frontier_points,
+      bool has_goal) {
+    visualization_msgs::msg::MarkerArray marker_array;
+
+    if (!has_goal || goal_distances.size() == 0) {
+      visualization_msgs::msg::Marker clear_marker;
+      clear_marker.header.frame_id = "map";
+      clear_marker.header.stamp = this->get_clock()->now();
+      clear_marker.ns = "frontier_goal_distance";
+      clear_marker.id = 0;
+      clear_marker.action = visualization_msgs::msg::Marker::DELETEALL;
+      marker_array.markers.push_back(clear_marker);
+      frontier_goal_distance_markers_pub_->publish(marker_array);
+      return;
+    }
+
+    const double min_val = goal_distances.minCoeff();
+    const double max_val = goal_distances.maxCoeff();
+    const double range = std::max(max_val - min_val, 1e-9);
+
+    int marker_id = 0;
+    for (int i = 0; i < goal_distances.size(); ++i) {
+      const double normalized_dist = (goal_distances(i) - min_val) / range;
+      const double normalized_closeness = 1.0 - normalized_dist;
+
+      visualization_msgs::msg::Marker marker;
+      marker.header.frame_id = "map";
+      marker.header.stamp = this->get_clock()->now();
+      marker.ns = "frontier_goal_distance";
+      marker.id = marker_id++;
+      marker.type = visualization_msgs::msg::Marker::SPHERE;
+      marker.action = visualization_msgs::msg::Marker::ADD;
+
+      marker.pose.position.x = frontier_points(i, 0);
+      marker.pose.position.y = frontier_points(i, 1);
+      marker.pose.position.z = 0.3;  // Higher to avoid overlap
+      marker.pose.orientation.w = 1.0;
+
+      marker.scale.x = 0.1;
+      marker.scale.y = 0.1;
+      marker.scale.z = 0.1;
+
+      // Closer to goal -> brighter marker.
+      value_to_color(normalized_closeness, marker.color.r, marker.color.g,
+                     marker.color.b);
+      marker.color.a = 1.0;
+
+      marker_array.markers.push_back(marker);
+    }
+
+    frontier_goal_distance_markers_pub_->publish(marker_array);
+  }
+
+  void publish_frontier_robot_distance_markers(
+      const Eigen::VectorXd &robot_distances,
+      const Eigen::MatrixXd &frontier_points) {
+    visualization_msgs::msg::MarkerArray marker_array;
+
+    if (robot_distances.size() == 0) {
+      frontier_robot_distance_markers_pub_->publish(marker_array);
+      return;
+    }
+
+    const double min_val = robot_distances.minCoeff();
+    const double max_val = robot_distances.maxCoeff();
+    const double range = std::max(max_val - min_val, 1e-9);
+
+    int marker_id = 0;
+    for (int i = 0; i < robot_distances.size(); ++i) {
+      const double normalized_dist = (robot_distances(i) - min_val) / range;
+      const double normalized_closeness = 1.0 - normalized_dist;
+
+      visualization_msgs::msg::Marker marker;
+      marker.header.frame_id = "map";
+      marker.header.stamp = this->get_clock()->now();
+      marker.ns = "frontier_robot_distance";
+      marker.id = marker_id++;
+      marker.type = visualization_msgs::msg::Marker::SPHERE;
+      marker.action = visualization_msgs::msg::Marker::ADD;
+
+      marker.pose.position.x = frontier_points(i, 0);
+      marker.pose.position.y = frontier_points(i, 1);
+      marker.pose.position.z = 0.4;  // Higher to avoid overlap
+      marker.pose.orientation.w = 1.0;
+
+      marker.scale.x = 0.1;
+      marker.scale.y = 0.1;
+      marker.scale.z = 0.1;
+
+      // Closer to robot -> brighter marker.
+      value_to_color(normalized_closeness, marker.color.r, marker.color.g,
+                     marker.color.b);
+      marker.color.a = 1.0;
+
+      marker_array.markers.push_back(marker);
+    }
+
+    frontier_robot_distance_markers_pub_->publish(marker_array);
   }
 
   void publish_frontier_overall_score_markers(
@@ -2378,7 +2534,12 @@ private:
 
     int marker_id = 0;
     for (size_t i = 0; i < candidates.size(); ++i) {
+      const auto &candidate = candidates[i];
       double normalized = (overall_scores[i] - min_val) / range;
+      const int frontier_idx = candidate.frontier_idx;
+      if (frontier_idx < 0 || frontier_idx >= frontier_points.rows()) {
+        continue;
+      }
 
       visualization_msgs::msg::Marker marker;
       marker.header.frame_id = "map";
@@ -2388,8 +2549,8 @@ private:
       marker.type = visualization_msgs::msg::Marker::SPHERE;
       marker.action = visualization_msgs::msg::Marker::ADD;
 
-      marker.pose.position.x = frontier_points(i, 0);
-      marker.pose.position.y = frontier_points(i, 1);
+      marker.pose.position.x = frontier_points(frontier_idx, 0);
+      marker.pose.position.y = frontier_points(frontier_idx, 1);
       marker.pose.position.z = 0.2;  // Higher to avoid overlap
       marker.pose.orientation.w = 1.0;
 
