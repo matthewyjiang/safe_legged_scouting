@@ -10,6 +10,7 @@
 #include <boost/geometry/strategies/buffer.hpp>
 #include <cstdlib>
 #include <fstream>
+#include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/polygon.hpp>
 #include <geometry_msgs/msg/pose.hpp>
 #include <iomanip>
@@ -44,6 +45,7 @@ public:
     this->declare_parameter("goal_tolerance", 0.1);
     this->declare_parameter("next_subgoal_tolerance", 0.1);
     this->declare_parameter("simplify_tolerance", 0.2);
+    this->declare_parameter("naive_mode", false);
 
     // Read parameters and configure diffeomorphism parameters
     double p = this->get_parameter("p").as_double();
@@ -60,6 +62,11 @@ public:
     next_subgoal_tolerance_ =
         this->get_parameter("next_subgoal_tolerance").as_double();
     simplify_tolerance_ = this->get_parameter("simplify_tolerance").as_double();
+    naive_mode_ = this->get_parameter("naive_mode").as_bool();
+
+    if (naive_mode_) {
+      RCLCPP_INFO(this->get_logger(), "Naive mode ENABLED — bypassing diffeomorphism/obstacle avoidance");
+    }
 
     // Set default workspace (will be updated when envelope is received)
     std::vector<std::vector<double>> default_workspace = {
@@ -102,6 +109,12 @@ public:
     subgoal_sub_ = this->create_subscription<geometry_msgs::msg::Point>(
         "/current_subgoal", 10,
         std::bind(&ReactiveNavigationNode::subgoal_callback, this,
+                  std::placeholders::_1));
+
+    // Subscribe to goal point (used in naive mode)
+    goal_point_sub_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
+        "goal_point", 10,
+        std::bind(&ReactiveNavigationNode::goal_point_callback, this,
                   std::placeholders::_1));
 
     // Create control command publisher
@@ -174,6 +187,7 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::Polygon>::SharedPtr envelope_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Pose>::SharedPtr pose_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Point>::SharedPtr subgoal_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr goal_point_sub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr subgoal_reached_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
@@ -230,6 +244,11 @@ private:
   double env_y_max_ = 0.0;
   polygon envelope_polygon_map_;
   bool has_envelope_ = false;
+
+  // Naive mode state
+  bool naive_mode_ = false;
+  geometry_msgs::msg::Point goal_point_;
+  bool has_goal_point_ = false;
 
   std::vector<polygon> get_merged_dilated_polygons() {
     if (obstacle_polygons_.empty()) {
@@ -501,6 +520,13 @@ private:
                 current_subgoal_.x, current_subgoal_.y, current_subgoal_.z);
   }
 
+  void goal_point_callback(const geometry_msgs::msg::PointStamped::SharedPtr msg) {
+    goal_point_ = msg->point;
+    has_goal_point_ = true;
+    RCLCPP_INFO(this->get_logger(), "Received goal point: x=%.3f, y=%.3f",
+                goal_point_.x, goal_point_.y);
+  }
+
   void pose_callback(const geometry_msgs::msg::Pose::SharedPtr msg) {
     // Update current position from pose
     current_position_ = msg->position;
@@ -519,6 +545,57 @@ private:
     if (!has_robot_pose_) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                            "No robot pose available for control");
+      return;
+    }
+
+    // Naive mode: simple proportional control toward goal_point
+    if (naive_mode_) {
+      geometry_msgs::msg::Twist cmd_vel;
+      cmd_vel.linear.x = 0.0;
+      cmd_vel.linear.y = 0.0;
+      cmd_vel.angular.z = 0.0;
+
+      if (!has_goal_point_) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                             "Naive mode: no goal point received yet");
+        cmd_vel_pub_->publish(cmd_vel);
+        return;
+      }
+
+      double dx = goal_point_.x - current_position_.x;
+      double dy = goal_point_.y - current_position_.y;
+      double distance = std::sqrt(dx * dx + dy * dy);
+
+      if (distance < goal_tolerance_) {
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                             "Naive mode: within goal tolerance (%.3f m)", distance);
+        cmd_vel_pub_->publish(cmd_vel);
+        return;
+      }
+
+      double angle_to_goal = std::atan2(dy, dx);
+      double angle_error = angle_to_goal - current_yaw_;
+      // Normalize angle error to [-pi, pi]
+      while (angle_error > M_PI) angle_error -= 2.0 * M_PI;
+      while (angle_error < -M_PI) angle_error += 2.0 * M_PI;
+
+      double linear_vel = linear_gain_ * distance;
+      double angular_vel = angular_gain_ * angle_error;
+
+      // Clamp velocities
+      linear_vel = std::min(linear_vel, linear_cmd_limit_);
+      linear_vel = std::max(linear_vel, -linear_cmd_limit_);
+      angular_vel = std::min(angular_vel, angular_cmd_limit_);
+      angular_vel = std::max(angular_vel, -angular_cmd_limit_);
+
+      cmd_vel.linear.x = linear_vel;
+      cmd_vel.angular.z = angular_vel;
+
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                           "Naive mode: dist=%.3f, angle_err=%.3f, lin=%.3f, ang=%.3f",
+                           distance, angle_error, linear_vel, angular_vel);
+
+      cmd_vel_pub_->publish(cmd_vel);
       return;
     }
 

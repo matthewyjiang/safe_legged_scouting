@@ -101,7 +101,6 @@ target_link_libraries(
     CGAL::CGAL_Core
 )
 
-
 rosidl_target_interfaces(safe_bayesian_optimization_node
   ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
@@ -123,6 +122,7 @@ ament_target_dependencies(
 # Install Python scripts
 install(PROGRAMS
   src/turtlesim_spatial_publisher.py
+  src/evaluation_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
