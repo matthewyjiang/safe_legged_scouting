@@ -11,3 +11,5 @@ reactive_planner:
     linear_cmd_limit: 0.3     # Maximum linear velocity command (m/s)
     angular_cmd_limit: 1.0    # Maximum angular velocity command (rad/s)
     goal_tolerance: 0.1       # Distance tolerance to stop near subgoal (meters)
+    next_subgoal_tolerance: 0.1 # Distance tolerance to publish subgoal reached (meters)
+    naive_mode: false             # If true, bypass diffeomorphism and use simple proportional control toward goal_point

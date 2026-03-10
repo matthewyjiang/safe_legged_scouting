@@ -2,6 +2,7 @@
 #include "safe_bayesian_optimization/msg/polygon_array.hpp"
 #include "trusses_custom_interfaces/srv/get_terrain_map_with_uncertainty.hpp"
 #include "std_msgs/msg/int32.hpp"
+#include "std_msgs/msg/empty.hpp"
 #include <CGAL/Alpha_shape_2.h>
 #include <CGAL/Alpha_shape_face_base_2.h>
 #include <CGAL/Alpha_shape_vertex_base_2.h>
@@ -23,12 +24,15 @@
 #include <cmath>
 #include <cv_bridge/cv_bridge.h>
 #include <geometry_msgs/msg/point.hpp>
+#include <geometry_msgs/msg/pose.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/polygon.hpp>
 #include <limits>
 #include <memory>
+#include <map>
 #include <opencv2/opencv.hpp>
 #include <queue>
+#include <string>
 #include <unordered_map>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -52,6 +56,12 @@ public:
                             std::vector<double>{0.1, 0.1});
     this->declare_parameter("debug.publish_debug_image", false);
     this->declare_parameter("opt.subgoal_erosion", 0.2);
+    this->declare_parameter("opt.preference_order",
+                            std::vector<std::string>{"g", "l", "e"});
+    this->declare_parameter("opt.update_on_measurement", false);
+    this->declare_parameter("opt.expansion_score_k", 1.0);
+    this->declare_parameter("opt.goal_score_k", 1.0);
+    this->declare_parameter("opt.selection_strategy", std::string("max"));
     this->declare_parameter("robot.radius", 0.5);
     this->declare_parameter("polygon.simplification_tolerance", 0.1);
 
@@ -72,6 +82,18 @@ public:
     publish_debug_image_ =
         this->get_parameter("debug.publish_debug_image").as_bool();
     subgoal_erosion_ = this->get_parameter("opt.subgoal_erosion").as_double();
+    auto preference_order_param =
+        this->get_parameter("opt.preference_order").as_string_array();
+    update_on_measurement_ = this->get_parameter("opt.update_on_measurement").as_bool();
+    expansion_score_k_ = this->get_parameter("opt.expansion_score_k").as_double();
+    goal_score_k_ = this->get_parameter("opt.goal_score_k").as_double();
+    selection_strategy_ = this->get_parameter("opt.selection_strategy").as_string();
+    if (selection_strategy_ != "max" && selection_strategy_ != "alternating_preference" && selection_strategy_ != "goal_only") {
+      RCLCPP_WARN(this->get_logger(),
+                  "Unknown opt.selection_strategy '%s'; defaulting to 'max'",
+                  selection_strategy_.c_str());
+      selection_strategy_ = "max";
+    }
     robot_radius_ = this->get_parameter("robot.radius").as_double();
     simplification_tolerance_ = this->get_parameter("polygon.simplification_tolerance").as_double();
 
@@ -86,11 +108,21 @@ public:
             "goal_point", 10,
             std::bind(&OptimizerNode::goal_point_callback, this,
                       std::placeholders::_1));
+
+    robot_pose_sub_ = this->create_subscription<geometry_msgs::msg::Pose>(
+        robot_pose_topic, 10,
+        std::bind(&OptimizerNode::robot_pose_callback, this,
+                  std::placeholders::_1));
     
     spatial_data_size_sub_ =
         this->create_subscription<std_msgs::msg::Int32>(
             "spatial_data_size", 10,
             std::bind(&OptimizerNode::spatial_data_size_callback, this,
+                      std::placeholders::_1));
+    subgoal_reached_sub_ =
+        this->create_subscription<std_msgs::msg::Empty>(
+            "/subgoal_reached", 10,
+            std::bind(&OptimizerNode::subgoal_reached_callback, this,
                       std::placeholders::_1));
 
     // Create publishers
@@ -116,6 +148,23 @@ public:
     projected_goal_marker_pub_ =
         this->create_publisher<visualization_msgs::msg::Marker>(
             "/projected_goal_marker", 10);
+
+    // Create frontier visualization marker array publishers
+    frontier_goal_score_markers_pub_ =
+        this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            "/frontier_goal_score_markers", 10);
+    frontier_expansion_prob_markers_pub_ =
+        this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            "/frontier_expansion_prob_markers", 10);
+    frontier_overall_score_markers_pub_ =
+        this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            "/frontier_overall_score_markers", 10);
+    frontier_goal_distance_markers_pub_ =
+        this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            "/frontier_goal_distance_markers", 10);
+    frontier_robot_distance_markers_pub_ =
+        this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            "/frontier_robot_distance_markers", 10);
 
     // Only create debug image publisher if enabled
     if (publish_debug_image_) {
@@ -148,6 +197,10 @@ private:
   double f_max_;
   double lipschitz_L_;
   double subgoal_erosion_;
+  bool update_on_measurement_;
+  std::string selection_strategy_;
+  double expansion_score_k_;
+  double goal_score_k_;
   double robot_radius_;
   double simplification_tolerance_;
 
@@ -156,8 +209,10 @@ private:
       SharedPtr terrain_map_client_;
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr
       goal_point_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::Pose>::SharedPtr robot_pose_sub_;
   rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr
       spatial_data_size_sub_;
+  rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr subgoal_reached_sub_;
   int last_spatial_data_size_;
   rclcpp::Publisher<geometry_msgs::msg::Point>::SharedPtr current_subgoal_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr
@@ -169,6 +224,16 @@ private:
       concave_markers_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr
       projected_goal_marker_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
+      frontier_goal_score_markers_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
+      frontier_expansion_prob_markers_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
+      frontier_overall_score_markers_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
+      frontier_goal_distance_markers_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
+      frontier_robot_distance_markers_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr debug_image_pub_;
 
   // Parameters from config
@@ -207,211 +272,84 @@ private:
       }
     }
 
-    int find(int x) {
-      if (parent_[x] != x) {
-        parent_[x] = find(parent_[x]); // Path compression
-      }
-      return parent_[x];
-    }
+  void ComputeSets() {
+    UpdateMonotonicConfidenceIntervals();
+    UpdateSafeSetWithLipschitz();
+  }
 
-    void union_sets(int x, int y) {
-      int root_x = find(x);
-      int root_y = find(y);
-
-      if (root_x != root_y) {
-        // Union by rank
-        if (rank_[root_x] < rank_[root_y]) {
-          parent_[root_x] = root_y;
-        } else if (rank_[root_x] > rank_[root_y]) {
-          parent_[root_y] = root_x;
-        } else {
-          parent_[root_y] = root_x;
-          rank_[root_x]++;
-        }
-      }
-    }
-
-    std::vector<std::vector<int>> get_disjoint_sets() {
-      std::map<int, std::vector<int>> groups;
-      for (const auto &pair : parent_) {
-        int element = pair.first;
-        int root = find(element);
-        groups[root].push_back(element);
-      }
-
-      std::vector<std::vector<int>> result;
-      for (const auto &group : groups) {
-        result.push_back(group.second);
-      }
-      return result;
-    }
-  };
-
-  std::vector<std::vector<int>>
-  compute_disjoint_sets_direct(const std::vector<int> &safe_indices,
-                               double distance_threshold) {
-    RCLCPP_INFO(this->get_logger(),
-                "[OPTIMIZED] Using spatial grid-based disjoint set algorithm");
-
-    // Initialize DisjointSet with point indices
-    DisjointSet ds;
-    for (int idx : safe_indices) {
-      ds.make_set(idx);
-    }
-
-    // Find bounds of safe points
-    double min_x = std::numeric_limits<double>::max();
-    double max_x = std::numeric_limits<double>::lowest();
-    double min_y = std::numeric_limits<double>::max();
-    double max_y = std::numeric_limits<double>::lowest();
-    
-    for (int idx : safe_indices) {
-      min_x = std::min(min_x, D_(idx, 0));
-      max_x = std::max(max_x, D_(idx, 0));
-      min_y = std::min(min_y, D_(idx, 1));
-      max_y = std::max(max_y, D_(idx, 1));
-    }
-    
-    // Create spatial grid with cell size equal to distance threshold
-    double cell_size = distance_threshold;
-    int grid_width = static_cast<int>((max_x - min_x) / cell_size) + 1;
-    int grid_height = static_cast<int>((max_y - min_y) / cell_size) + 1;
-    
-    RCLCPP_INFO(this->get_logger(), "[OPTIMIZED] Grid size: %dx%d, cell_size: %f", 
-                grid_width, grid_height, cell_size);
-    
-    // Create grid to store point indices
-    std::vector<std::vector<std::vector<int>>> grid(grid_width, 
-        std::vector<std::vector<int>>(grid_height));
-    
-    // Insert points into grid
-    for (int idx : safe_indices) {
-      int grid_x = static_cast<int>((D_(idx, 0) - min_x) / cell_size);
-      int grid_y = static_cast<int>((D_(idx, 1) - min_y) / cell_size);
-      
-      // Clamp to grid bounds
-      grid_x = std::max(0, std::min(grid_x, grid_width - 1));
-      grid_y = std::max(0, std::min(grid_y, grid_height - 1));
-      
-      grid[grid_x][grid_y].push_back(idx);
-    }
-
-    int merge_count = 0;
-    double squared_threshold = distance_threshold * distance_threshold;
-    
-    RCLCPP_INFO(this->get_logger(), "[OPTIMIZED] Using spatial grid with threshold: %f", distance_threshold);
-    
-    // For each grid cell, check points against neighboring cells
-    for (int gx = 0; gx < grid_width; ++gx) {
-      for (int gy = 0; gy < grid_height; ++gy) {
-        if (grid[gx][gy].empty()) continue;
-        
-        // Check points within same cell
-        for (size_t i = 0; i < grid[gx][gy].size(); ++i) {
-          int idx1 = grid[gx][gy][i];
-          
-          for (size_t j = i + 1; j < grid[gx][gy].size(); ++j) {
-            int idx2 = grid[gx][gy][j];
-            
-            double dx = D_(idx1, 0) - D_(idx2, 0);
-            double dy = D_(idx1, 1) - D_(idx2, 1);
-            double squared_distance = dx * dx + dy * dy;
-            
-            if (squared_distance <= squared_threshold) {
-              ds.union_sets(idx1, idx2);
-              merge_count++;
-            }
-          }
-        }
-        
-        // Check points against neighboring cells (only check right and down neighbors to avoid duplicates)
-        for (int dx = 0; dx <= 1; ++dx) {
-          for (int dy = (dx == 0 ? 1 : -1); dy <= 1; ++dy) {
-            int nx = gx + dx;
-            int ny = gy + dy;
-            
-            if (nx >= grid_width || ny < 0 || ny >= grid_height) continue;
-            if (grid[nx][ny].empty()) continue;
-            
-            // Check all point pairs between current cell and neighbor cell
-            for (int idx1 : grid[gx][gy]) {
-              for (int idx2 : grid[nx][ny]) {
-                double dx_dist = D_(idx1, 0) - D_(idx2, 0);
-                double dy_dist = D_(idx1, 1) - D_(idx2, 1);
-                double squared_distance = dx_dist * dx_dist + dy_dist * dy_dist;
-                
-                if (squared_distance <= squared_threshold) {
-                  ds.union_sets(idx1, idx2);
-                  merge_count++;
-                }
-              }
-            }
-          }
-        }
-      }
-      
-      // Progress logging for large grids
-      if (gx % 100 == 0 && gx > 0) {
-        RCLCPP_INFO(this->get_logger(), "[OPTIMIZED] Processed %d/%d grid columns, %d merges so far", 
-                   gx, grid_width, merge_count);
+  std::vector<PreferenceMetric> ParsePreferenceOrder(
+      const std::vector<std::string> &order) {
+    std::vector<PreferenceMetric> metrics;
+    metrics.reserve(order.size());
+    for (const auto &token : order) {
+      if (token == "g" || token == "goal") {
+        metrics.push_back(PreferenceMetric::Goal);
+      } else if (token == "l" || token == "last") {
+        metrics.push_back(PreferenceMetric::Last);
+      } else if (token == "e" || token == "expansion") {
+        metrics.push_back(PreferenceMetric::Expansion);
+      } else {
+        RCLCPP_WARN(this->get_logger(),
+                    "Unknown preference token '%s' in opt.preference_order",
+                    token.c_str());
       }
     }
-
-    RCLCPP_INFO(this->get_logger(), "[OPTIMIZED] Performed %d merge operations",
-                merge_count);
-
-    // Extract disjoint sets
-    auto components = ds.get_disjoint_sets();
-
-    RCLCPP_INFO(this->get_logger(), "[OPTIMIZED] Found %zu connected components",
-                components.size());
-
-    // Log component sizes (limit to first 10)
-    size_t max_log = std::min(static_cast<size_t>(10), components.size());
-    for (size_t i = 0; i < max_log; ++i) {
-      RCLCPP_INFO(this->get_logger(), "[OPTIMIZED] Component %zu has %zu points",
-                  i, components[i].size());
-    }
-    if (components.size() > max_log) {
-      RCLCPP_INFO(this->get_logger(), "[OPTIMIZED] ... and %zu more components",
-                  components.size() - max_log);
-    }
-
-    return components;
+    return metrics;
   }
 
 
-  std::vector<std::vector<int>> compute_disjoint_safe_sets() {
-    RCLCPP_INFO(this->get_logger(),
-                "[DISJOINT] Starting compute_disjoint_safe_sets()");
-
-    std::vector<int> safe_indices;
-
-    // Collect all safe point indices
-    for (int i = 0; i < S_.rows(); ++i) {
-      if (S_(i)) {
-        safe_indices.push_back(i);
-      }
+  void InitializeConfidenceBoundsIfNeeded() {
+    if (C_low_.size() == mu_.size()) {
+      return;
     }
 
-    RCLCPP_INFO(this->get_logger(), "[DISJOINT] Found %zu safe points",
-                safe_indices.size());
+    const double neg_inf = -std::numeric_limits<double>::infinity();
+    const double pos_inf = std::numeric_limits<double>::infinity();
 
-    if (safe_indices.empty()) {
+    C_low_.resize(mu_.size());
+    C_high_.resize(mu_.size());
+    C_low_.setConstant(neg_inf);
+    C_high_.setConstant(pos_inf);
+
+    S_.resize(mu_.size());
+    S_.setConstant(false);
+
+    confidence_initialized_ = true;
+    safe_set_initialized_ = false;
+  }
+
+  void UpdateMonotonicConfidenceIntervals() {
+    InitializeConfidenceBoundsIfNeeded();
+
+    const double sqrt_beta = std::sqrt(beta_);
+    const Eigen::VectorXd confidence = sqrt_beta * std_;
+
+    const Eigen::VectorXd Q_low = mu_ - confidence;
+    const Eigen::VectorXd Q_high = mu_ + confidence;
+
+    Q_.col(0) = Q_low;
+    Q_.col(1) = Q_high;
+
+    C_low_ = C_low_.cwiseMax(Q_low);
+    C_high_ = C_high_.cwiseMin(Q_high);
+  }
+
+  void UpdateSafeSetWithLipschitz() {
+    if (S_.rows() == 0 || D_.rows() == 0) {
+      return;
+    }
+
+    if (lipschitz_L_ <= 0.0) {
       RCLCPP_WARN(this->get_logger(),
-                  "[DISJOINT] No safe points found, returning empty");
-      return {};
+                  "Lipschitz constant <= 0; safe set will not expand.");
+      return;
     }
 
-    // Distance threshold: resolution_width * 2 - epsilon
-    double distance_threshold =
-        std::max(terrain_x_resolution_, terrain_y_resolution_) * 2.0 - 1e-6;
-    RCLCPP_INFO(this->get_logger(), "[DISJOINT] Using distance threshold: %f",
-                distance_threshold);
+    const int n_points = D_.rows();
+    std::vector<char> safe_flags(n_points, 0);
 
-    // Use direct distance approach
-    return compute_disjoint_sets_direct(safe_indices, distance_threshold);
-  }
+    std::vector<int> anchor_indices;
+    anchor_indices.reserve(n_points);
 
   void ComputeSets() {
     UpdateMonotonicConfidenceIntervals();
@@ -649,6 +587,7 @@ private:
   }
 
   int GetNextSubgoal() {
+    const auto start = std::chrono::steady_clock::now();
     // Get frontier indices
     const std::vector<int> frontier_indices = FindSafetyContourIndices();
 
@@ -657,16 +596,129 @@ private:
       return -1;
     }
 
+    if (!has_robot_pose_) {
+      RCLCPP_WARN(this->get_logger(),
+                  "No robot pose available; cannot select subgoal");
+      return -1;
+    }
+
+    // Build safety image for connected components.
+    double min_x = D_.col(0).minCoeff();
+    double max_x = D_.col(0).maxCoeff();
+    double min_y = D_.col(1).minCoeff();
+    double max_y = D_.col(1).maxCoeff();
+    int width = terrain_width_cells_;
+    int height = terrain_height_cells_;
+
+    if (width <= 0 || height <= 0 || max_x == min_x || max_y == min_y) {
+      RCLCPP_WARN(this->get_logger(),
+                  "Invalid grid bounds for safe region lookup");
+      return -1;
+    }
+
+    auto map_to_grid = [=](double x, double y, int &gx, int &gy) {
+      const double nx = (x - min_x) / (max_x - min_x);
+      const double ny = (y - min_y) / (max_y - min_y);
+      const int max_gx = std::max(width - 1, 0);
+      const int max_gy = std::max(height - 1, 0);
+      gx = static_cast<int>(std::lround(nx * max_gx));
+      gy = static_cast<int>(std::lround(ny * max_gy));
+      gx = std::clamp(gx, 0, max_gx);
+      gy = std::clamp(gy, 0, max_gy);
+    };
+
+    const auto safety_image_start = std::chrono::steady_clock::now();
+    cv::Mat safety_image = cv::Mat::zeros(height, width, CV_8UC1);
+    for (int i = 0; i < D_.rows(); ++i) {
+      int gx = 0;
+      int gy = 0;
+      map_to_grid(D_(i, 0), D_(i, 1), gx, gy);
+      if (gx >= 0 && gx < width && gy >= 0 && gy < height) {
+        safety_image.at<uchar>(gy, gx) = S_(i) ? 255 : 0;
+      }
+    }
+    const auto safety_image_end = std::chrono::steady_clock::now();
+
+    const auto connected_start = std::chrono::steady_clock::now();
+    cv::Mat labels;
+    cv::connectedComponents(safety_image, labels, 8, CV_32S);
+    const auto connected_end = std::chrono::steady_clock::now();
+
+    int robot_gx = 0;
+    int robot_gy = 0;
+    map_to_grid(current_robot_position_.x, current_robot_position_.y, robot_gx,
+                robot_gy);
+    if (robot_gx < 0 || robot_gx >= width || robot_gy < 0 ||
+        robot_gy >= height) {
+      RCLCPP_WARN(this->get_logger(),
+                  "Robot position is outside grid bounds");
+      return -1;
+    }
+
+    int robot_label = labels.at<int>(robot_gy, robot_gx);
+    if (robot_label == 0) {
+      int nearest_safe_idx = -1;
+      double nearest_dist_sq = std::numeric_limits<double>::infinity();
+      for (int i = 0; i < D_.rows(); ++i) {
+        if (!S_(i)) {
+          continue;
+        }
+        const double dx = D_(i, 0) - current_robot_position_.x;
+        const double dy = D_(i, 1) - current_robot_position_.y;
+        const double dist_sq = dx * dx + dy * dy;
+        if (dist_sq < nearest_dist_sq) {
+          nearest_dist_sq = dist_sq;
+          nearest_safe_idx = i;
+        }
+      }
+
+      if (nearest_safe_idx >= 0) {
+        int safe_gx = 0;
+        int safe_gy = 0;
+        map_to_grid(D_(nearest_safe_idx, 0), D_(nearest_safe_idx, 1), safe_gx,
+                    safe_gy);
+        robot_label = labels.at<int>(safe_gy, safe_gx);
+      }
+    }
+
+    if (robot_label == 0) {
+      RCLCPP_WARN(this->get_logger(),
+                  "Robot is not within any safe region");
+      return -1;
+    }
+
+    const auto candidate_start = std::chrono::steady_clock::now();
+    std::vector<int> candidate_indices;
+    candidate_indices.reserve(frontier_indices.size());
+    for (int idx : frontier_indices) {
+      int gx = 0;
+      int gy = 0;
+      map_to_grid(D_(idx, 0), D_(idx, 1), gx, gy);
+      if (gx >= 0 && gx < width && gy >= 0 && gy < height &&
+          labels.at<int>(gy, gx) == robot_label) {
+        candidate_indices.push_back(idx);
+      }
+    }
+    const auto candidate_end = std::chrono::steady_clock::now();
+
+    if (candidate_indices.empty()) {
+      RCLCPP_WARN(this->get_logger(),
+                  "No frontier points found in robot's safe region");
+      return -1;
+    }
+
     // Extract frontier points
-    const size_t num_frontiers = frontier_indices.size();
+    const auto frontier_extract_start = std::chrono::steady_clock::now();
+    const size_t num_frontiers = candidate_indices.size();
     Eigen::MatrixXd frontier_points(num_frontiers, 2);
     Eigen::VectorXd frontier_confidence_width(num_frontiers);
 
     for (size_t i = 0; i < num_frontiers; ++i) {
-      const int idx = frontier_indices[i];
+      const int idx = candidate_indices[i];
       frontier_points.row(i) = D_.row(idx);
       frontier_confidence_width(i) = Q_(idx, 1) - Q_(idx, 0);
     }
+    const auto frontier_extract_end = std::chrono::steady_clock::now();
 
     if (!goal_received_) {
       double best_confidence_width = -1.0;
@@ -693,15 +745,130 @@ private:
     const Eigen::VectorXd goal_eigen =
         (Eigen::VectorXd(2) << current_goal_.point.x, current_goal_.point.y)
             .finished();
-    const Eigen::VectorXd distances =
-        (frontier_points.rowwise() - goal_eigen.transpose()).rowwise().norm();
+    const Eigen::VectorXd robot_to_candidate_distances =
+        (frontier_points.rowwise() - robot_position_eigen.transpose())
+            .rowwise()
+            .norm();
+    const Eigen::VectorXd robot_scores =
+        (-goal_score_k_ * robot_to_candidate_distances.array()).exp().matrix();
 
-    // Sort points by distance to goal
-    std::vector<std::pair<double, size_t>> distance_pairs;
-    for (size_t i = 0; i < num_frontiers; ++i) {
-      distance_pairs.emplace_back(distances(i), i);
+    const auto goal_scores_start = std::chrono::steady_clock::now();
+    Eigen::VectorXd goal_scores(num_frontiers);
+    Eigen::VectorXd goal_distances = Eigen::VectorXd::Zero(num_frontiers);
+    if (goal_received_) {
+      const Eigen::VectorXd goal_eigen =
+          (Eigen::VectorXd(2) << current_goal_.point.x, current_goal_.point.y)
+              .finished();
+      goal_distances =
+          (frontier_points.rowwise() - goal_eigen.transpose()).rowwise().norm();
+      // goal_score = exp(-goal_score_k * (goal_distance + robot_distance))
+      goal_scores =
+          (-goal_score_k_ *
+           (goal_distances.array() + robot_to_candidate_distances.array()))
+              .exp()
+              .matrix();
+    } else {
+      // If no goal, use robot_distance only.
+      goal_scores = robot_scores;
     }
-    std::sort(distance_pairs.begin(), distance_pairs.end());
+
+    const auto expansion_start = std::chrono::steady_clock::now();
+    Eigen::VectorXi expansion_scores =
+        Eigen::VectorXi::Zero(static_cast<int>(num_frontiers));
+    if (lipschitz_L_ > 0.0) {
+      std::vector<std::vector<int>> unsafe_bins;
+      unsafe_bins.resize(static_cast<size_t>(width * height));
+      int unsafe_count = 0;
+      for (int j = 0; j < D_.rows(); ++j) {
+        if (S_(j)) {
+          continue;
+        }
+        int gx = 0;
+        int gy = 0;
+        map_to_grid(D_(j, 0), D_(j, 1), gx, gy);
+        if (gx >= 0 && gx < width && gy >= 0 && gy < height) {
+          unsafe_bins[static_cast<size_t>(gy * width + gx)].push_back(j);
+          ++unsafe_count;
+        }
+      }
+
+      if (unsafe_count > 0) {
+        const double cell_size_x =
+            (max_x - min_x) / std::max(width - 1, 1);
+        const double cell_size_y =
+            (max_y - min_y) / std::max(height - 1, 1);
+        const double min_cell_size =
+            std::max(std::min(cell_size_x, cell_size_y), 1e-9);
+
+        for (size_t i = 0; i < num_frontiers; ++i) {
+          const int idx = candidate_indices[i];
+          const double l_t = Q_(idx, 0);
+          const double radius = (f_max_ - l_t) / lipschitz_L_;
+          if (radius <= 0.0) {
+            continue;
+          }
+
+          const double radius_sq = radius * radius;
+          int center_gx = 0;
+          int center_gy = 0;
+          map_to_grid(frontier_points(i, 0), frontier_points(i, 1), center_gx,
+                      center_gy);
+          const int r_cells =
+              static_cast<int>(std::ceil(radius / min_cell_size));
+          const int gx_min = std::max(center_gx - r_cells, 0);
+          const int gx_max = std::min(center_gx + r_cells, width - 1);
+          const int gy_min = std::max(center_gy - r_cells, 0);
+          const int gy_max = std::min(center_gy + r_cells, height - 1);
+
+          int expansion_score = 0;
+          for (int gy = gy_min; gy <= gy_max; ++gy) {
+            for (int gx = gx_min; gx <= gx_max; ++gx) {
+              const auto &bin =
+                  unsafe_bins[static_cast<size_t>(gy * width + gx)];
+              if (bin.empty()) {
+                continue;
+              }
+              for (int unsafe_idx : bin) {
+                const double dx = D_(unsafe_idx, 0) - frontier_points(i, 0);
+                const double dy = D_(unsafe_idx, 1) - frontier_points(i, 1);
+                if (dx * dx + dy * dy <= radius_sq) {
+                  ++expansion_score;
+                }
+              }
+            }
+          }
+          expansion_scores(static_cast<int>(i)) = expansion_score;
+        }
+      }
+    }
+    const auto expansion_end = std::chrono::steady_clock::now();
+
+    // Helper function for sigmoid: maps expansion_score to [0,1] using k parameter
+    // prob_expansion = 1 - exp(-k * expansion_score)
+    // When expansion_score = 0: prob_expansion = 0
+    // Higher k = faster approach to 1.0
+    auto compute_prob_expansion = [this](double expansion_score) -> double {
+      if (expansion_score <= 0.0) {
+        return 0.0;
+      }
+      return 1.0 - std::exp(-expansion_score_k_ * expansion_score);
+    };
+
+    const auto pareto_start = std::chrono::steady_clock::now();
+    std::vector<CandidateScore> candidates;
+    candidates.reserve(num_frontiers);
+    for (size_t i = 0; i < num_frontiers; ++i) {
+      double exp_score = static_cast<double>(expansion_scores(static_cast<int>(i)));
+      double prob_exp = compute_prob_expansion(exp_score);
+      CandidateScore candidate{
+          goal_scores(static_cast<int>(i)),
+          robot_scores(static_cast<int>(i)),
+          exp_score,
+          prob_exp,
+          static_cast<int>(i),
+          candidate_indices[i]};
+      candidates.push_back(candidate);
+    }
 
     // Take top 25% of closest points
     size_t top_quarter_size = std::max(size_t(1), distance_pairs.size() / 4);
@@ -718,6 +885,120 @@ private:
         best_confidence_width = conf_width;
         best_index = static_cast<int>(frontier_idx);
       }
+      pareto_end = std::chrono::steady_clock::now();
+
+      // --- Strategy-specific selection from Pareto front ---
+      if (selection_strategy_ == "alternating_preference") {
+        PreferenceMetric preference = PreferenceMetric::Expansion;
+        const char *preference_name = "expansion";
+        if (goal_received_) {
+          if (preference_order_.empty()) {
+            RCLCPP_WARN(this->get_logger(),
+                        "Preference order is empty; using goal score.");
+            preference_order_ = {PreferenceMetric::Goal};
+            preference_index_ = 0;
+          }
+
+          preference =
+              preference_order_[preference_index_ % preference_order_.size()];
+          preference_name = "unknown";
+          switch (preference) {
+          case PreferenceMetric::Goal:
+            preference_name = "goal";
+            break;
+          case PreferenceMetric::Last:
+            preference_name = "last(robot_continuity)";
+            break;
+          case PreferenceMetric::Expansion:
+            preference_name = "expansion";
+            break;
+          }
+          preference_index_ =
+              (preference_index_ + 1) % preference_order_.size();
+        }
+        RCLCPP_INFO(this->get_logger(),
+                    "Selecting subgoal using strategy: alternating_preference, "
+                    "preference: %s",
+                    preference_name);
+
+        preference_start = std::chrono::steady_clock::now();
+        for (const auto &entry : frontier_2d) {
+          const CandidateScore &candidate = entry.second;
+          double metric_value = 0.0;
+          switch (preference) {
+          case PreferenceMetric::Goal:
+            metric_value = candidate.goal_score;
+            break;
+          case PreferenceMetric::Last:
+            metric_value = candidate.robot_score;
+            break;
+          case PreferenceMetric::Expansion:
+            metric_value = candidate.prob_expansion;
+            break;
+          }
+
+          if (!best || metric_value > best_metric) {
+            best = &candidate;
+            best_metric = metric_value;
+          }
+        }
+        preference_end = std::chrono::steady_clock::now();
+      } else {
+        // "max" strategy: pick Pareto-optimal candidate with highest
+        // overall_score = goal_score * prob_expansion
+        preference_start = std::chrono::steady_clock::now();
+        for (const auto &entry : frontier_2d) {
+          const CandidateScore &candidate = entry.second;
+          const double overall_score =
+              candidate.goal_score * candidate.prob_expansion;
+          if (!best || overall_score > best_metric) {
+            best = &candidate;
+            best_metric = overall_score;
+          }
+        }
+        preference_end = std::chrono::steady_clock::now();
+        RCLCPP_INFO(this->get_logger(),
+                    "Selecting subgoal using strategy: max (overall_score = "
+                    "goal_score * prob_expansion, from %zu Pareto-optimal "
+                    "candidates)",
+                    frontier_2d.size());
+      }
+    }
+
+    if (!best) {
+      RCLCPP_INFO(this->get_logger(),
+                  "Timing(GetNextSubgoal): safety_image=%ld ms, "
+                  "connected=%ld ms, candidates=%ld ms, extract=%ld ms, "
+                  "goal_scores=%ld ms, expansion=%ld ms, pareto=%ld ms, "
+                  "preference=%ld ms, total=%ld ms",
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      safety_image_end - safety_image_start)
+                      .count(),
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      connected_end - connected_start)
+                      .count(),
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      candidate_end - candidate_start)
+                      .count(),
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      frontier_extract_end - frontier_extract_start)
+                      .count(),
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      expansion_start - goal_scores_start)
+                      .count(),
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      expansion_end - expansion_start)
+                      .count(),
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      pareto_end - pareto_start)
+                      .count(),
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      preference_end - preference_start)
+                      .count(),
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      preference_end - start)
+                      .count());
+      return frontier_indices.front();
     }
 
     if (best_index < 0) {
@@ -740,9 +1021,33 @@ private:
       
       last_spatial_data_size_ = current_size;
       
-      // Request terrain map when size changes
-      request_terrain_map();
+      // Update terrain map if update_on_measurement is enabled
+      if (update_on_measurement_) {
+        RCLCPP_INFO(this->get_logger(),
+                    "Update on measurement enabled; requesting terrain map update "
+                    "(safe sets will update, but subgoal remains until reached)");
+        // Do NOT set new_subgoal_requested_ here: the current subgoal should
+        // persist until the robot explicitly reaches it (subgoal_reached_callback).
+        // The terrain map, safe sets, polygons, etc. will still be recomputed.
+        request_terrain_map();
+      } else {
+        // Defer terrain map updates until the subgoal is reached.
+        RCLCPP_DEBUG(this->get_logger(),
+                     "Update on measurement disabled; deferring terrain map update until subgoal reached");
+      }
     }
+  }
+
+  void subgoal_reached_callback(const std_msgs::msg::Empty::SharedPtr) {
+    RCLCPP_INFO(this->get_logger(),
+                "Subgoal reached; requesting terrain map update");
+    new_subgoal_requested_ = true;
+    request_terrain_map();
+  }
+
+  void robot_pose_callback(const geometry_msgs::msg::Pose::SharedPtr msg) {
+    current_robot_position_ = msg->position;
+    has_robot_pose_ = true;
   }
 
   void request_terrain_map() {
@@ -806,6 +1111,9 @@ private:
       const std::shared_ptr<const trusses_custom_interfaces::srv::
                                 GetTerrainMapWithUncertainty::Response>
           response) {
+    const auto process_start = std::chrono::steady_clock::now();
+    has_terrain_map_ = true;
+
     // Update the parameter set D_, mean mu_, and std_ with the new terrain map
     // data
     const size_t num_points = response->x_coords.size();
@@ -823,10 +1131,35 @@ private:
       std_(i) = response->uncertainties[i];
     }
 
+    const auto compute_sets_start = std::chrono::steady_clock::now();
     // Recompute sets with new data
+    RCLCPP_INFO(this->get_logger(), 
+                "Updating safe set with %zu data points (update_on_measurement=%s)",
+                num_points, update_on_measurement_ ? "true" : "false");
     ComputeSets();
+    const auto compute_sets_end = std::chrono::steady_clock::now();
+    int safe_count = S_.count();
+    RCLCPP_INFO(this->get_logger(), 
+                "Safe set updated: %d/%zu points are safe", safe_count, num_points);
 
+    const auto publish_polygons_start = std::chrono::steady_clock::now();
     publish_obstacle_polygons();
+    const auto publish_polygons_end = std::chrono::steady_clock::now();
+
+    const auto subgoal_start = std::chrono::steady_clock::now();
+    const bool should_select_subgoal = new_subgoal_requested_ || !last_subgoal_valid_;
+    if (should_select_subgoal) {
+      // Check if the goal itself is safe by checking if it's within the eroded
+      // polygon
+      bg::model::d2::point_xy<double> goal_point(current_goal_.point.x,
+                                                 current_goal_.point.y);
+
+      geometry_msgs::msg::Point subgoal;
+      if (goal_received_ && bg::within(goal_point, eroded_concave_polygon_)) {
+        // Goal is safe, use it directly as the subgoal
+        subgoal.x = current_goal_.point.x;
+        subgoal.y = current_goal_.point.y;
+        subgoal.z = 0.0;
 
     // Check if the goal itself is safe by checking if it's within the eroded
     // polygon
@@ -862,30 +1195,78 @@ private:
           point polygeom_point(boost_point.get<0>(), boost_point.get<1>());
           eroded_poly_for_projection.outer().push_back(polygeom_point);
         }
+        const auto get_subgoal_start = std::chrono::steady_clock::now();
+        // Goal is not safe, find frontier subgoal and project it
+        const int next_subgoal_index = GetNextSubgoal();
+        const auto get_subgoal_end = std::chrono::steady_clock::now();
+        if (next_subgoal_index >= 0) {
+          // Get the raw subgoal from the terrain map
+          double raw_x = response->x_coords[next_subgoal_index];
+          double raw_y = response->y_coords[next_subgoal_index];
 
-        bg::correct(eroded_poly_for_projection);
+          // Convert boost polygon to polygeom_lib polygon format
+          polygon eroded_poly_for_projection;
+          for (const auto &boost_point : eroded_concave_polygon_.outer()) {
+            point polygeom_point(boost_point.get<0>(), boost_point.get<1>());
+            eroded_poly_for_projection.outer().push_back(polygeom_point);
+          }
 
-        RCLCPP_INFO(this->get_logger(),
-                    "Next subgoal index: %d, coordinates: (%f, %f)",
-                    next_subgoal_index, raw_x, raw_y);
+          bg::correct(eroded_poly_for_projection);
 
-        // Create point from raw subgoal coordinates
-        point raw_subgoal_point(raw_x, raw_y);
+          RCLCPP_INFO(this->get_logger(),
+                      "Next subgoal index: %d, coordinates: (%f, %f)",
+                      next_subgoal_index, raw_x, raw_y);
 
-        // Project the subgoal onto the eroded safe region using polydist
-        ProjectionResultStruct projection_result =
-            polydist(eroded_poly_for_projection, raw_subgoal_point);
+          // Create point from raw subgoal coordinates
+          point raw_subgoal_point(raw_x, raw_y);
 
-        RCLCPP_INFO(this->get_logger(),
-                    "Projected subgoal point: (%f, %f), distance: %f",
-                    projection_result.projected_point.get<0>(),
-                    projection_result.projected_point.get<1>(),
-                    projection_result.dist);
+          // Project the subgoal onto the eroded safe region using polydist
+          const auto project_start = std::chrono::steady_clock::now();
+          ProjectionResultStruct projection_result =
+              polydist(eroded_poly_for_projection, raw_subgoal_point);
+          const auto project_end = std::chrono::steady_clock::now();
 
-        // Create final subgoal message from projected point
-        subgoal.x = projection_result.projected_point.get<0>();
-        subgoal.y = projection_result.projected_point.get<1>();
-        subgoal.z = 0.0;
+          RCLCPP_INFO(this->get_logger(),
+                      "Projected subgoal point: (%f, %f), distance: %f",
+                      projection_result.projected_point.get<0>(),
+                      projection_result.projected_point.get<1>(),
+                      projection_result.dist);
+
+          // Create final subgoal message from projected point
+          subgoal.x = projection_result.projected_point.get<0>();
+          subgoal.y = projection_result.projected_point.get<1>();
+          subgoal.z = 0.0;
+
+          // Publish visualization of the projection when a goal is available
+          if (goal_received_) {
+            const auto marker_start = std::chrono::steady_clock::now();
+            publish_projected_goal_marker(current_goal_.point, subgoal,
+                                          projection_result.dist);
+            const auto marker_end = std::chrono::steady_clock::now();
+            RCLCPP_INFO(this->get_logger(),
+                        "Timing: publish_projected_goal_marker=%ld ms",
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            marker_end - marker_start)
+                            .count());
+          }
+
+          RCLCPP_INFO(this->get_logger(),
+                      "Published projected subgoal: (%f, %f) (distance: %f)",
+                      subgoal.x, subgoal.y, projection_result.dist);
+          RCLCPP_INFO(this->get_logger(),
+                      "Timing: GetNextSubgoal=%ld ms, polydist=%ld ms",
+                      std::chrono::duration_cast<std::chrono::milliseconds>(
+                          get_subgoal_end - get_subgoal_start)
+                          .count(),
+                      std::chrono::duration_cast<std::chrono::milliseconds>(
+                          project_end - project_start)
+                          .count());
+        } else {
+          RCLCPP_WARN(this->get_logger(), "No valid subgoal found");
+          return;
+        }
+      }
+      current_subgoal_pub_->publish(subgoal);
 
         // Publish visualization of the projection when a goal is available
         if (goal_received_) {
@@ -893,19 +1274,35 @@ private:
                                         projection_result.dist);
         }
 
-        RCLCPP_INFO(this->get_logger(),
-                    "Published projected subgoal: (%f, %f) (distance: %f)",
-                    subgoal.x, subgoal.y, projection_result.dist);
-      } else {
-        RCLCPP_WARN(this->get_logger(), "No valid subgoal found");
-        return;
+      last_subgoal_ = subgoal;
+      last_subgoal_valid_ = true;
+      new_subgoal_requested_ = false;
+      if (goal_received_ && !preference_order_.empty()) {
+        preference_index_ =
+            (preference_index_ + 1) % preference_order_.size();
       }
+    } else {
+      RCLCPP_INFO(this->get_logger(),
+                  "Map update received; keeping current subgoal until reached");
     }
+    const auto subgoal_end = std::chrono::steady_clock::now();
 
-    current_subgoal_pub_->publish(subgoal);
-
-    // Publish subgoal marker for visualization
-    publish_subgoal_marker(subgoal);
+    const auto process_end = std::chrono::steady_clock::now();
+    RCLCPP_INFO(this->get_logger(),
+                "Timing: process_terrain_map=%ld ms, ComputeSets=%ld ms, "
+                "publish_obstacle_polygons=%ld ms, subgoal_block=%ld ms",
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    process_end - process_start)
+                    .count(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    compute_sets_end - compute_sets_start)
+                    .count(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    publish_polygons_end - publish_polygons_start)
+                    .count(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    subgoal_end - subgoal_start)
+                    .count());
   }
 
   bg::model::polygon<bg::model::d2::point_xy<double>>
@@ -1065,65 +1462,24 @@ private:
       return;
     }
 
-    // // Compute disjoint sets of safe points (COMMENTED OUT)
-    // RCLCPP_INFO(this->get_logger(), "[MAIN] Computing disjoint sets...");
-    // std::vector<std::vector<int>> disjoint_sets = compute_disjoint_safe_sets();
+    // Create polygons with holes using OpenCV contours (more efficient than Alpha Shapes)
+    RCLCPP_INFO(this->get_logger(), "[MAIN] Creating safe region polygons from contours...");
 
-    // if (disjoint_sets.empty()) {
-    //   RCLCPP_WARN(this->get_logger(), "[MAIN] No disjoint sets found");
-    //   return;
-    // }
+    // Find grid bounds
+    double min_x = D_.col(0).minCoeff();
+    double max_x = D_.col(0).maxCoeff();
+    double min_y = D_.col(1).minCoeff();
+    double max_y = D_.col(1).maxCoeff();
 
-    // RCLCPP_INFO(this->get_logger(), "[MAIN] Found %zu disjoint safe sets",
-    //             disjoint_sets.size());
+    // Use stored grid dimensions from service response
+    int width = terrain_width_cells_;
+    int height = terrain_height_cells_;
 
-    // // Create multiple concave polygons from each disjoint set (COMMENTED OUT)
-    // RCLCPP_INFO(this->get_logger(), "[MAIN] Creating concave polygons...");
-    // std::vector<bg::model::polygon<bg::model::d2::point_xy<double>>>
-    //     concave_polygons;
-    // std::vector<std::array<double, 2>> all_boundaries;
+    RCLCPP_INFO(this->get_logger(), "[MAIN] Grid bounds: X=[%.2f, %.2f], Y=[%.2f, %.2f], size=%dx%d",
+                min_x, max_x, min_y, max_y, width, height);
 
-    // int polygon_count = 0;
-    // for (size_t i = 0; i < disjoint_sets.size(); ++i) {
-    //   const auto &point_set = disjoint_sets[i];
-    //   RCLCPP_INFO(this->get_logger(),
-    //               "[MAIN] Processing set %zu with %zu points", i,
-    //               point_set.size());
-
-    //   if (point_set.size() >= 3) { // Need at least 3 points for a polygon
-    //     auto polygon = create_concave_polygon_from_points(point_set);
-    //     if (!polygon.outer().empty()) {
-    //       concave_polygons.push_back(polygon);
-    //       polygon_count++;
-    //       RCLCPP_INFO(
-    //           this->get_logger(),
-    //           "[MAIN] Successfully created polygon %d with %zu boundary points",
-    //           polygon_count, polygon.outer().size());
-
-    //       // Collect boundary points for visualization
-    //       for (const auto &point : polygon.outer()) {
-    //         all_boundaries.push_back({point.get<0>(), point.get<1>()});
-    //       }
-    //     } else {
-    //       RCLCPP_WARN(this->get_logger(),
-    //                   "[MAIN] Failed to create polygon from set %zu", i);
-    //     }
-    //   } else {
-    //     RCLCPP_INFO(this->get_logger(),
-    //                 "[MAIN] Skipping set %zu - insufficient points (%zu)", i,
-    //                 point_set.size());
-    //   }
-    // }
-
-    // if (concave_polygons.empty()) {
-    //   RCLCPP_WARN(this->get_logger(),
-    //               "[MAIN] No valid concave polygons created");
-    //   return;
-    // }
-
-    // RCLCPP_INFO(this->get_logger(),
-    //             "[MAIN] Successfully created %zu concave polygons",
-    //             concave_polygons.size());
+    // Create binary image from safety data
+    cv::Mat safety_image = cv::Mat::zeros(height, width, CV_8UC1);
 
     // Create polygons with holes using OpenCV contours (more efficient than Alpha Shapes)
     RCLCPP_INFO(this->get_logger(), "[MAIN] Creating safe region polygons from contours...");
@@ -1486,7 +1842,7 @@ private:
         bg::model::d2::point_xy<double>(envelope_box.min_corner().get<0>(),
                                         envelope_box.max_corner().get<1>()));
     bg::correct(envelope_polygon);
-    
+
     // Erode the envelope polygon by robot radius
     bg::strategy::buffer::distance_symmetric<double> envelope_erosion_distance(
         -robot_radius_);
@@ -1723,6 +2079,11 @@ private:
 
   void
   goal_point_callback(const geometry_msgs::msg::PointStamped::SharedPtr msg) {
+    // Check if the goal actually changed (ignore re-publishes of the same goal)
+    const double dx = msg->point.x - current_goal_.point.x;
+    const double dy = msg->point.y - current_goal_.point.y;
+    const bool goal_changed = !goal_received_ || (dx * dx + dy * dy > 1e-6);
+
     current_goal_.point = msg->point;
     goal_received_ = true;
 
@@ -1980,6 +2341,271 @@ private:
     // Small delay to ensure line is published first
     rclcpp::sleep_for(std::chrono::milliseconds(10));
     projected_goal_marker_pub_->publish(arrow_marker);
+  }
+
+  // Helper function to map value to color (yellow = high, green = low)
+  void value_to_color(double normalized_value, float &r, float &g, float &b) {
+    // Normalized value should be in [0, 1]
+    // Black (low, value=0.0) -> White (high, value=1.0)
+    // Clamp to [0, 1]
+    normalized_value = std::clamp(normalized_value, 0.0, 1.0);
+    
+    // Linear interpolation: black (0,0,0) to white (1,1,1)
+    r = normalized_value;      // Red: 0.0 at low, 1.0 at high
+    g = normalized_value;       // Green: 0.0 at low, 1.0 at high
+    b = normalized_value;       // Blue: 0.0 at low, 1.0 at high
+  }
+
+  void publish_frontier_goal_score_markers(
+      const std::vector<CandidateScore> &candidates,
+      const Eigen::MatrixXd &frontier_points) {
+    visualization_msgs::msg::MarkerArray marker_array;
+
+    // Find min/max goal_score for normalization
+    double min_val = std::numeric_limits<double>::max();
+    double max_val = std::numeric_limits<double>::lowest();
+    for (const auto &candidate : candidates) {
+      if (candidate.goal_score < min_val) min_val = candidate.goal_score;
+      if (candidate.goal_score > max_val) max_val = candidate.goal_score;
+    }
+    double range = std::max(max_val - min_val, 1e-9);
+
+    int marker_id = 0;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      const auto &candidate = candidates[i];
+      double normalized = (candidate.goal_score - min_val) / range;
+      const int frontier_idx = candidate.frontier_idx;
+      if (frontier_idx < 0 || frontier_idx >= frontier_points.rows()) {
+        continue;
+      }
+
+      visualization_msgs::msg::Marker marker;
+      marker.header.frame_id = "map";
+      marker.header.stamp = this->get_clock()->now();
+      marker.ns = "frontier_goal_score";
+      marker.id = marker_id++;
+      marker.type = visualization_msgs::msg::Marker::SPHERE;
+      marker.action = visualization_msgs::msg::Marker::ADD;
+
+      marker.pose.position.x = frontier_points(frontier_idx, 0);
+      marker.pose.position.y = frontier_points(frontier_idx, 1);
+      marker.pose.position.z = 0.0;
+      marker.pose.orientation.w = 1.0;
+
+      marker.scale.x = 0.1;
+      marker.scale.y = 0.1;
+      marker.scale.z = 0.1;
+
+      value_to_color(normalized, marker.color.r, marker.color.g, marker.color.b);
+      marker.color.a = 1.0;
+
+      marker_array.markers.push_back(marker);
+    }
+
+    frontier_goal_score_markers_pub_->publish(marker_array);
+  }
+
+  void publish_frontier_expansion_prob_markers(
+      const std::vector<CandidateScore> &candidates,
+      const Eigen::MatrixXd &frontier_points) {
+    visualization_msgs::msg::MarkerArray marker_array;
+
+    // Find min/max prob_expansion for normalization
+    double min_val = std::numeric_limits<double>::max();
+    double max_val = std::numeric_limits<double>::lowest();
+    for (const auto &candidate : candidates) {
+      if (candidate.prob_expansion < min_val) min_val = candidate.prob_expansion;
+      if (candidate.prob_expansion > max_val) max_val = candidate.prob_expansion;
+    }
+    double range = std::max(max_val - min_val, 1e-9);
+
+    int marker_id = 0;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      const auto &candidate = candidates[i];
+      double normalized = (candidate.prob_expansion - min_val) / range;
+      const int frontier_idx = candidate.frontier_idx;
+      if (frontier_idx < 0 || frontier_idx >= frontier_points.rows()) {
+        continue;
+      }
+
+      visualization_msgs::msg::Marker marker;
+      marker.header.frame_id = "map";
+      marker.header.stamp = this->get_clock()->now();
+      marker.ns = "frontier_expansion_prob";
+      marker.id = marker_id++;
+      marker.type = visualization_msgs::msg::Marker::SPHERE;
+      marker.action = visualization_msgs::msg::Marker::ADD;
+
+      marker.pose.position.x = frontier_points(frontier_idx, 0);
+      marker.pose.position.y = frontier_points(frontier_idx, 1);
+      marker.pose.position.z = 0.1;  // Slightly higher to avoid overlap
+      marker.pose.orientation.w = 1.0;
+
+      marker.scale.x = 0.1;
+      marker.scale.y = 0.1;
+      marker.scale.z = 0.1;
+
+      value_to_color(normalized, marker.color.r, marker.color.g, marker.color.b);
+      marker.color.a = 1.0;
+
+      marker_array.markers.push_back(marker);
+    }
+
+    frontier_expansion_prob_markers_pub_->publish(marker_array);
+  }
+
+  void publish_frontier_goal_distance_markers(
+      const Eigen::VectorXd &goal_distances,
+      const Eigen::MatrixXd &frontier_points,
+      bool has_goal) {
+    visualization_msgs::msg::MarkerArray marker_array;
+
+    if (!has_goal || goal_distances.size() == 0) {
+      visualization_msgs::msg::Marker clear_marker;
+      clear_marker.header.frame_id = "map";
+      clear_marker.header.stamp = this->get_clock()->now();
+      clear_marker.ns = "frontier_goal_distance";
+      clear_marker.id = 0;
+      clear_marker.action = visualization_msgs::msg::Marker::DELETEALL;
+      marker_array.markers.push_back(clear_marker);
+      frontier_goal_distance_markers_pub_->publish(marker_array);
+      return;
+    }
+
+    const double min_val = goal_distances.minCoeff();
+    const double max_val = goal_distances.maxCoeff();
+    const double range = std::max(max_val - min_val, 1e-9);
+
+    int marker_id = 0;
+    for (int i = 0; i < goal_distances.size(); ++i) {
+      const double normalized_dist = (goal_distances(i) - min_val) / range;
+      const double normalized_closeness = 1.0 - normalized_dist;
+
+      visualization_msgs::msg::Marker marker;
+      marker.header.frame_id = "map";
+      marker.header.stamp = this->get_clock()->now();
+      marker.ns = "frontier_goal_distance";
+      marker.id = marker_id++;
+      marker.type = visualization_msgs::msg::Marker::SPHERE;
+      marker.action = visualization_msgs::msg::Marker::ADD;
+
+      marker.pose.position.x = frontier_points(i, 0);
+      marker.pose.position.y = frontier_points(i, 1);
+      marker.pose.position.z = 0.3;  // Higher to avoid overlap
+      marker.pose.orientation.w = 1.0;
+
+      marker.scale.x = 0.1;
+      marker.scale.y = 0.1;
+      marker.scale.z = 0.1;
+
+      // Closer to goal -> brighter marker.
+      value_to_color(normalized_closeness, marker.color.r, marker.color.g,
+                     marker.color.b);
+      marker.color.a = 1.0;
+
+      marker_array.markers.push_back(marker);
+    }
+
+    frontier_goal_distance_markers_pub_->publish(marker_array);
+  }
+
+  void publish_frontier_robot_distance_markers(
+      const Eigen::VectorXd &robot_distances,
+      const Eigen::MatrixXd &frontier_points) {
+    visualization_msgs::msg::MarkerArray marker_array;
+
+    if (robot_distances.size() == 0) {
+      frontier_robot_distance_markers_pub_->publish(marker_array);
+      return;
+    }
+
+    const double min_val = robot_distances.minCoeff();
+    const double max_val = robot_distances.maxCoeff();
+    const double range = std::max(max_val - min_val, 1e-9);
+
+    int marker_id = 0;
+    for (int i = 0; i < robot_distances.size(); ++i) {
+      const double normalized_dist = (robot_distances(i) - min_val) / range;
+      const double normalized_closeness = 1.0 - normalized_dist;
+
+      visualization_msgs::msg::Marker marker;
+      marker.header.frame_id = "map";
+      marker.header.stamp = this->get_clock()->now();
+      marker.ns = "frontier_robot_distance";
+      marker.id = marker_id++;
+      marker.type = visualization_msgs::msg::Marker::SPHERE;
+      marker.action = visualization_msgs::msg::Marker::ADD;
+
+      marker.pose.position.x = frontier_points(i, 0);
+      marker.pose.position.y = frontier_points(i, 1);
+      marker.pose.position.z = 0.4;  // Higher to avoid overlap
+      marker.pose.orientation.w = 1.0;
+
+      marker.scale.x = 0.1;
+      marker.scale.y = 0.1;
+      marker.scale.z = 0.1;
+
+      // Closer to robot -> brighter marker.
+      value_to_color(normalized_closeness, marker.color.r, marker.color.g,
+                     marker.color.b);
+      marker.color.a = 1.0;
+
+      marker_array.markers.push_back(marker);
+    }
+
+    frontier_robot_distance_markers_pub_->publish(marker_array);
+  }
+
+  void publish_frontier_overall_score_markers(
+      const std::vector<CandidateScore> &candidates,
+      const Eigen::MatrixXd &frontier_points) {
+    visualization_msgs::msg::MarkerArray marker_array;
+
+    // Compute overall_score = prob_expansion * goal_score
+    std::vector<double> overall_scores;
+    overall_scores.reserve(candidates.size());
+    for (const auto &candidate : candidates) {
+      overall_scores.push_back(candidate.prob_expansion * candidate.goal_score);
+    }
+
+    // Find min/max overall_score for normalization
+    double min_val = *std::min_element(overall_scores.begin(), overall_scores.end());
+    double max_val = *std::max_element(overall_scores.begin(), overall_scores.end());
+    double range = std::max(max_val - min_val, 1e-9);
+
+    int marker_id = 0;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      const auto &candidate = candidates[i];
+      double normalized = (overall_scores[i] - min_val) / range;
+      const int frontier_idx = candidate.frontier_idx;
+      if (frontier_idx < 0 || frontier_idx >= frontier_points.rows()) {
+        continue;
+      }
+
+      visualization_msgs::msg::Marker marker;
+      marker.header.frame_id = "map";
+      marker.header.stamp = this->get_clock()->now();
+      marker.ns = "frontier_overall_score";
+      marker.id = marker_id++;
+      marker.type = visualization_msgs::msg::Marker::SPHERE;
+      marker.action = visualization_msgs::msg::Marker::ADD;
+
+      marker.pose.position.x = frontier_points(frontier_idx, 0);
+      marker.pose.position.y = frontier_points(frontier_idx, 1);
+      marker.pose.position.z = 0.2;  // Higher to avoid overlap
+      marker.pose.orientation.w = 1.0;
+
+      marker.scale.x = 0.2;
+      marker.scale.y = 0.2;
+      marker.scale.z = 0.2;
+
+      value_to_color(normalized, marker.color.r, marker.color.g, marker.color.b);
+      marker.color.a = 0.8;
+
+      marker_array.markers.push_back(marker);
+    }
+
+    frontier_overall_score_markers_pub_->publish(marker_array);
   }
 };
 

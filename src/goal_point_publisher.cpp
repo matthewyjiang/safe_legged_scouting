@@ -11,6 +11,9 @@
 class GoalPointPublisher : public rclcpp::Node {
 public:
   GoalPointPublisher() : Node("goal_point_publisher") {
+    this->declare_parameter("exploration_mode", false);
+    exploration_mode_ = this->get_parameter("exploration_mode").as_bool();
+
     publisher_ = this->create_publisher<geometry_msgs::msg::PointStamped>(
         "goal_point", 10);
 
@@ -49,7 +52,9 @@ public:
     
     publish_all_goal_markers();
 
-    RCLCPP_INFO(this->get_logger(), "Goal Point Publisher initialized with %zu waypoints", waypoints_.size());
+    RCLCPP_INFO(this->get_logger(),
+                "Goal Point Publisher initialized with %zu waypoints (exploration_mode=%s)",
+                waypoints_.size(), exploration_mode_ ? "true" : "false");
   }
 
 private:
@@ -86,6 +91,9 @@ private:
   }
 
   void check_waypoint_progress() {
+    if (exploration_mode_) {
+      return;
+    }
     if (waypoints_.empty() || current_waypoint_index_ >= waypoints_.size()) {
       return;
     }
@@ -207,19 +215,22 @@ private:
       marker.scale.z = 0.3;
 
       if (i < current_waypoint_index_) {
+        // Past goals: cyan
         marker.color.r = 0.0;
         marker.color.g = 1.0;
-        marker.color.b = 0.0;
+        marker.color.b = 1.0;
         marker.color.a = 0.7;
       } else if (i == current_waypoint_index_) {
+        // Current goal: yellow
         marker.color.r = 1.0;
-        marker.color.g = 0.0;
+        marker.color.g = 1.0;
         marker.color.b = 0.0;
         marker.color.a = 1.0;
       } else {
+        // Future goals: lime
         marker.color.r = 0.0;
-        marker.color.g = 0.0;
-        marker.color.b = 1.0;
+        marker.color.g = 1.0;
+        marker.color.b = 0.0;
         marker.color.a = 0.5;
       }
 
@@ -243,6 +254,7 @@ private:
   size_t current_waypoint_index_;
   geometry_msgs::msg::Pose current_pose_;
   bool pose_received_ = false;
+  bool exploration_mode_ = false;
 };
 
 int main(int argc, char *argv[]) {
