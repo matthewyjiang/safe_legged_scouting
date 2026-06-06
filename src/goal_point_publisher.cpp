@@ -4,7 +4,6 @@
 #include <std_srvs/srv/trigger.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
-#include <yaml-cpp/yaml.h>
 #include <vector>
 #include <cmath>
 

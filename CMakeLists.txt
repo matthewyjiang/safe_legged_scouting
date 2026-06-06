@@ -19,6 +19,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -70,7 +71,7 @@ add_executable(reactive_navigation_node src/reactive_navigation_node.cpp)
 
 # Add dependencies
 ament_target_dependencies(
-    safe_bayesian_optimization_node rclcpp trusses_custom_interfaces Eigen3 geometry_msgs sensor_msgs cv_bridge Boost OpenCV CGAL visualization_msgs
+    safe_bayesian_optimization_node rclcpp trusses_custom_interfaces Eigen3 geometry_msgs sensor_msgs std_msgs cv_bridge Boost OpenCV CGAL visualization_msgs
 )
 
 target_link_libraries(reactive_planner
@@ -112,7 +113,7 @@ ament_target_dependencies(
 )
 
 ament_target_dependencies(
-    reactive_navigation_node rclcpp geometry_msgs nav_msgs sensor_msgs tf2 tf2_ros tf2_geometry_msgs Boost turtlesim visualization_msgs
+    reactive_navigation_node rclcpp geometry_msgs nav_msgs sensor_msgs std_msgs tf2 tf2_ros tf2_geometry_msgs Boost turtlesim visualization_msgs
 )
 
 ament_target_dependencies(
