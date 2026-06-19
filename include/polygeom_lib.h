@@ -56,47 +56,49 @@ namespace bg = boost::geometry;
 namespace bgi = boost::geometry::index;
 
 // Define various geometries
-using point = bg::model::point<double, 2, bg::cs::cartesian>;
-using polygon = bg::model::polygon<point, false, true>;
-using line = bg::model::linestring<point>;
-using multi_point = bg::model::multi_point<point>;
-using multi_polygon = bg::model::multi_polygon<polygon>;
+using point = bg::model::point < double, 2, bg::cs::cartesian >;
+using polygon = bg::model::polygon < point, false, true >;
+using line = bg::model::linestring < point >;
+using multi_point = bg::model::multi_point < point >;
+using multi_polygon = bg::model::multi_polygon < polygon >;
 
 // Define CGAL types
 typedef CGAL::Exact_predicates_inexact_constructions_kernel CGAL_K;
-typedef CGAL::Partition_traits_2<CGAL_K> CGAL_Traits;
+typedef CGAL::Partition_traits_2 < CGAL_K > CGAL_Traits;
 typedef CGAL_Traits::Point_2 CGAL_Point_2;
 typedef CGAL_Traits::Polygon_2 CGAL_Polygon_2;
 typedef CGAL_Polygon_2::Vertex_iterator CGAL_Vertex_iterator;
-typedef std::list<CGAL_Polygon_2> CGAL_Polygon_list;
-typedef CGAL::Creator_uniform_2<int, CGAL_Point_2> CGAL_Creator;
-typedef CGAL::Random_points_in_square_2<CGAL_Point_2, CGAL_Creator>
-    CGAL_Point_generator;
+typedef std::list < CGAL_Polygon_2 > CGAL_Polygon_list;
+typedef CGAL::Creator_uniform_2 < int, CGAL_Point_2 > CGAL_Creator;
+typedef CGAL::Random_points_in_square_2 < CGAL_Point_2, CGAL_Creator >
+  CGAL_Point_generator;
 
-std::vector<std::vector<double>>
-MatrixMatrixMultiplication(std::vector<std::vector<double>> Matrix1,
-                           std::vector<std::vector<double>> Matrix2);
+std::vector < std::vector < double >>
+MatrixMatrixMultiplication(
+  std::vector < std::vector < double >> Matrix1,
+  std::vector < std::vector < double >> Matrix2);
 
-std::vector<double>
-MatrixVectorMultiplication(std::vector<std::vector<double>> Matrix,
-                           std::vector<double> Vector);
+std::vector < double >
+MatrixVectorMultiplication(
+  std::vector < std::vector < double >> Matrix,
+  std::vector < double > Vector);
 
-std::vector<std::vector<double>>
-VectorOuterProduct(std::vector<double> Vector1, std::vector<double> Vector2);
+std::vector < std::vector < double >>
+VectorOuterProduct(std::vector < double > Vector1, std::vector < double > Vector2);
 
-double MatrixDeterminant(std::vector<std::vector<double>> Matrix);
+double MatrixDeterminant(std::vector < std::vector < double >> Matrix);
 
-std::vector<point> StdToBoostPoint(std::vector<std::vector<double>> input);
+std::vector < point > StdToBoostPoint(std::vector < std::vector < double >> input);
 
-std::vector<std::vector<double>> BoostPointToStd(std::vector<point> input);
+std::vector < std::vector < double >> BoostPointToStd(std::vector < point > input);
 
-std::vector<point> BoostPolyToBoostPoint(polygon input);
+std::vector < point > BoostPolyToBoostPoint(polygon input);
 
-std::vector<point> BoostLineToBoostPoint(line input);
+std::vector < point > BoostLineToBoostPoint(line input);
 
-polygon BoostPointToBoostPoly(std::vector<point> input);
+polygon BoostPointToBoostPoly(std::vector < point > input);
 
-line BoostPointToBoostLine(std::vector<point> input);
+line BoostPointToBoostLine(std::vector < point > input);
 
 class TriangleClass {
   /**
@@ -121,65 +123,74 @@ class TriangleClass {
    * the parent 12) depth: Depth in the transformation 13) predecessor:
    * Predecessor in the purging transformation 14) index: Index of the tree
    */
-public:
-  double get_radius() const { return this->radius; }
-  std::vector<point> get_r_center_t() const { return this->r_center_t; }
-  std::vector<point> get_r_center_n() const { return this->r_center_n; }
-  std::vector<point> get_vertices() const { return this->vertices; }
-  std::vector<point> get_vertices_tilde() const { return this->vertices_tilde; }
-  std::vector<point> get_r_t() const { return this->r_t; }
-  std::vector<point> get_r_n() const { return this->r_n; }
-  std::vector<point> get_r_tilde_t() const { return this->r_tilde_t; }
-  std::vector<point> get_r_tilde_n() const { return this->r_tilde_n; }
-  point get_center() const { return this->center; }
-  std::vector<point> get_adj_edge() const { return this->adj_edge; }
-  uint16_t get_depth() const { return this->depth; }
-  int get_predecessor() const { return this->predecessor; }
-  uint16_t get_index() const { return this->index; }
 
-  void set_radius(double radius_in) { this->radius = radius_in; }
-  void set_r_center_t(std::vector<point> r_center_t_in) {
+public:
+  double get_radius() const {return this->radius;}
+  std::vector < point > get_r_center_t() const {return this->r_center_t;}
+  std::vector < point > get_r_center_n() const {return this->r_center_n;}
+  std::vector < point > get_vertices() const {return this->vertices;}
+  std::vector < point > get_vertices_tilde() const {return this->vertices_tilde;}
+  std::vector < point > get_r_t() const {return this->r_t;}
+  std::vector < point > get_r_n() const {return this->r_n;}
+  std::vector < point > get_r_tilde_t() const {return this->r_tilde_t;}
+  std::vector < point > get_r_tilde_n() const {return this->r_tilde_n;}
+  point get_center() const {return this->center;}
+  std::vector < point > get_adj_edge() const {return this->adj_edge;}
+  uint16_t get_depth() const {return this->depth;}
+  int get_predecessor() const {return this->predecessor;}
+  uint16_t get_index() const {return this->index;}
+
+  void set_radius(double radius_in) {this->radius = radius_in;}
+  void set_r_center_t(std::vector < point > r_center_t_in)
+  {
     this->r_center_t = r_center_t_in;
   }
-  void set_r_center_n(std::vector<point> r_center_n_in) {
+  void set_r_center_n(std::vector < point > r_center_n_in)
+  {
     this->r_center_n = r_center_n_in;
   }
-  void set_vertices(std::vector<point> vertices_in) {
+  void set_vertices(std::vector < point > vertices_in)
+  {
     this->vertices = vertices_in;
   }
-  void set_vertices_tilde(std::vector<point> vertices_tilde_in) {
+  void set_vertices_tilde(std::vector < point > vertices_tilde_in)
+  {
     this->vertices_tilde = vertices_tilde_in;
   }
-  void set_r_t(std::vector<point> r_t_in) { this->r_t = r_t_in; }
-  void set_r_n(std::vector<point> r_n_in) { this->r_n = r_n_in; }
-  void set_r_tilde_t(std::vector<point> r_tilde_t_in) {
+  void set_r_t(std::vector < point > r_t_in) {this->r_t = r_t_in;}
+  void set_r_n(std::vector < point > r_n_in) {this->r_n = r_n_in;}
+  void set_r_tilde_t(std::vector < point > r_tilde_t_in)
+  {
     this->r_tilde_t = r_tilde_t_in;
   }
-  void set_r_tilde_n(std::vector<point> r_tilde_n_in) {
+  void set_r_tilde_n(std::vector < point > r_tilde_n_in)
+  {
     this->r_tilde_n = r_tilde_n_in;
   }
-  void set_center(point center_in) { this->center = center_in; }
-  void set_adj_edge(std::vector<point> adj_edge_in) {
+  void set_center(point center_in) {this->center = center_in;}
+  void set_adj_edge(std::vector < point > adj_edge_in)
+  {
     this->adj_edge = adj_edge_in;
   }
-  void set_depth(uint16_t depth_in) { this->depth = depth_in; }
-  void set_predecessor(int predecessor_in) {
+  void set_depth(uint16_t depth_in) {this->depth = depth_in;}
+  void set_predecessor(int predecessor_in)
+  {
     this->predecessor = predecessor_in;
   }
-  void set_index(uint16_t index_in) { this->index = index_in; }
+  void set_index(uint16_t index_in) {this->index = index_in;}
 
 private:
   double radius = 0.0;
-  std::vector<point> r_center_t;
-  std::vector<point> r_center_n;
-  std::vector<point> vertices;
-  std::vector<point> vertices_tilde;
-  std::vector<point> r_t;
-  std::vector<point> r_n;
-  std::vector<point> r_tilde_t;
-  std::vector<point> r_tilde_n;
+  std::vector < point > r_center_t;
+  std::vector < point > r_center_n;
+  std::vector < point > vertices;
+  std::vector < point > vertices_tilde;
+  std::vector < point > r_t;
+  std::vector < point > r_n;
+  std::vector < point > r_tilde_t;
+  std::vector < point > r_tilde_n;
   point center;
-  std::vector<point> adj_edge;
+  std::vector < point > adj_edge;
   uint16_t depth;
   int predecessor;
   uint16_t index;
@@ -212,78 +223,89 @@ class PolygonClass {
    * transformation 14) predecessor: Predecessor in the purging transformation
    *  15) index: Index of the node in the tree
    */
+
 public:
-  double get_radius() const { return this->radius; }
-  std::vector<point> get_r_center_t() const { return this->r_center_t; }
-  std::vector<point> get_r_center_n() const { return this->r_center_n; }
-  std::vector<point> get_vertices() const { return this->vertices; }
-  std::vector<point> get_augmented_vertices() const {
+  double get_radius() const {return this->radius;}
+  std::vector < point > get_r_center_t() const {return this->r_center_t;}
+  std::vector < point > get_r_center_n() const {return this->r_center_n;}
+  std::vector < point > get_vertices() const {return this->vertices;}
+  std::vector < point > get_augmented_vertices() const {
     return this->augmented_vertices;
   }
-  std::vector<point> get_vertices_tilde() const { return this->vertices_tilde; }
-  std::vector<point> get_r_t() const { return this->r_t; }
-  std::vector<point> get_r_n() const { return this->r_n; }
-  std::vector<point> get_r_tilde_t() const { return this->r_tilde_t; }
-  std::vector<point> get_r_tilde_n() const { return this->r_tilde_n; }
-  point get_center() const { return this->center; }
-  std::vector<point> get_adj_edge() const { return this->adj_edge; }
-  uint16_t get_depth() const { return this->depth; }
-  int get_predecessor() const { return this->predecessor; }
-  uint16_t get_index() const { return this->index; }
+  std::vector < point > get_vertices_tilde() const {return this->vertices_tilde;}
+  std::vector < point > get_r_t() const {return this->r_t;}
+  std::vector < point > get_r_n() const {return this->r_n;}
+  std::vector < point > get_r_tilde_t() const {return this->r_tilde_t;}
+  std::vector < point > get_r_tilde_n() const {return this->r_tilde_n;}
+  point get_center() const {return this->center;}
+  std::vector < point > get_adj_edge() const {return this->adj_edge;}
+  uint16_t get_depth() const {return this->depth;}
+  int get_predecessor() const {return this->predecessor;}
+  uint16_t get_index() const {return this->index;}
 
-  void set_radius(double radius_in) { this->radius = radius_in; }
-  void set_r_center_t(std::vector<point> r_center_t_in) {
+  void set_radius(double radius_in) {this->radius = radius_in;}
+  void set_r_center_t(std::vector < point > r_center_t_in)
+  {
     this->r_center_t = r_center_t_in;
   }
-  void set_r_center_n(std::vector<point> r_center_n_in) {
+  void set_r_center_n(std::vector < point > r_center_n_in)
+  {
     this->r_center_n = r_center_n_in;
   }
-  void set_vertices(std::vector<point> vertices_in) {
+  void set_vertices(std::vector < point > vertices_in)
+  {
     this->vertices = vertices_in;
   }
-  void set_augmented_vertices(std::vector<point> augmented_vertices_in) {
+  void set_augmented_vertices(std::vector < point > augmented_vertices_in)
+  {
     this->augmented_vertices = augmented_vertices_in;
   }
-  void set_vertices_tilde(std::vector<point> vertices_tilde_in) {
+  void set_vertices_tilde(std::vector < point > vertices_tilde_in)
+  {
     this->vertices_tilde = vertices_tilde_in;
   }
-  void set_r_t(std::vector<point> r_t_in) { this->r_t = r_t_in; }
-  void set_r_n(std::vector<point> r_n_in) { this->r_n = r_n_in; }
-  void set_r_tilde_t(std::vector<point> r_tilde_t_in) {
+  void set_r_t(std::vector < point > r_t_in) {this->r_t = r_t_in;}
+  void set_r_n(std::vector < point > r_n_in) {this->r_n = r_n_in;}
+  void set_r_tilde_t(std::vector < point > r_tilde_t_in)
+  {
     this->r_tilde_t = r_tilde_t_in;
   }
-  void set_r_tilde_n(std::vector<point> r_tilde_n_in) {
+  void set_r_tilde_n(std::vector < point > r_tilde_n_in)
+  {
     this->r_tilde_n = r_tilde_n_in;
   }
-  void set_center(point center_in) { this->center = center_in; }
-  void set_adj_edge(std::vector<point> adj_edge_in) {
+  void set_center(point center_in) {this->center = center_in;}
+  void set_adj_edge(std::vector < point > adj_edge_in)
+  {
     this->adj_edge = adj_edge_in;
   }
-  void set_depth(uint16_t depth_in) { this->depth = depth_in; }
-  void set_predecessor(int predecessor_in) {
+  void set_depth(uint16_t depth_in) {this->depth = depth_in;}
+  void set_predecessor(int predecessor_in)
+  {
     this->predecessor = predecessor_in;
   }
-  void set_index(uint16_t index_in) { this->index = index_in; }
+  void set_index(uint16_t index_in) {this->index = index_in;}
 
 private:
   double radius = 0.0;
-  std::vector<point> r_center_t;
-  std::vector<point> r_center_n;
-  std::vector<point> vertices;
-  std::vector<point> augmented_vertices;
-  std::vector<point> vertices_tilde;
-  std::vector<point> r_t;
-  std::vector<point> r_n;
-  std::vector<point> r_tilde_t;
-  std::vector<point> r_tilde_n;
+  std::vector < point > r_center_t;
+  std::vector < point > r_center_n;
+  std::vector < point > vertices;
+  std::vector < point > augmented_vertices;
+  std::vector < point > vertices_tilde;
+  std::vector < point > r_t;
+  std::vector < point > r_n;
+  std::vector < point > r_tilde_t;
+  std::vector < point > r_tilde_n;
   point center;
-  std::vector<point> adj_edge;
+  std::vector < point > adj_edge;
   uint16_t depth;
   int predecessor;
   uint16_t index;
 };
 
-struct ProjectionResultStruct {
+struct ProjectionResultStruct
+{
   /**
    * Struct that contains the output of a projection result (i.e., point and
    * distance)
@@ -292,6 +314,7 @@ struct ProjectionResultStruct {
    *  1) projected_point: Result of the projection as a point on the projected
    * set 2) dist: Distance to the projected set
    */
+
 public:
   point projected_point;
   double dist;
@@ -307,14 +330,16 @@ ProjectionResultStruct polydist(polygon xy, point p);
 
 ProjectionResultStruct linedist(line xy, point p);
 
-void polytriangulation(std::vector<std::vector<double>> xy,
-                       std::vector<std::vector<double>> workspace,
-                       bool touching_boundary,
-                       std::vector<TriangleClass> *tree);
+void polytriangulation(
+  std::vector < std::vector < double >> xy,
+  std::vector < std::vector < double >> workspace,
+  bool touching_boundary,
+  std::vector < TriangleClass > * tree);
 
-void polyconvexdecomposition(std::vector<std::vector<double>> xy,
-                             std::vector<std::vector<double>> workspace,
-                             bool touching_boundary,
-                             std::vector<PolygonClass> *tree);
+void polyconvexdecomposition(
+  std::vector < std::vector < double >> xy,
+  std::vector < std::vector < double >> workspace,
+  bool touching_boundary,
+  std::vector < PolygonClass > * tree);
 
 #endif // POLYGEOM_LIB_H

@@ -71,7 +71,18 @@ add_executable(reactive_navigation_node src/reactive_navigation_node.cpp)
 
 # Add dependencies
 ament_target_dependencies(
-    safe_bayesian_optimization_node rclcpp trusses_custom_interfaces Eigen3 geometry_msgs sensor_msgs std_msgs cv_bridge Boost OpenCV CGAL visualization_msgs
+  safe_bayesian_optimization_node
+  rclcpp
+  trusses_custom_interfaces
+  Eigen3
+  geometry_msgs
+  sensor_msgs
+  std_msgs
+  cv_bridge
+  Boost
+  OpenCV
+  CGAL
+  visualization_msgs
 )
 
 target_link_libraries(reactive_planner
@@ -113,7 +124,18 @@ ament_target_dependencies(
 )
 
 ament_target_dependencies(
-    reactive_navigation_node rclcpp geometry_msgs nav_msgs sensor_msgs std_msgs tf2 tf2_ros tf2_geometry_msgs Boost turtlesim visualization_msgs
+  reactive_navigation_node
+  rclcpp
+  geometry_msgs
+  nav_msgs
+  sensor_msgs
+  std_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+  Boost
+  turtlesim
+  visualization_msgs
 )
 
 ament_target_dependencies(
@@ -171,8 +193,7 @@ if(BUILD_TESTING)
 
   add_test(
     NAME launch_package_wiring
-    COMMAND ${Python3_EXECUTABLE} -c
-            "from pathlib import Path; files=['launch/safe_scout.launch.py','launch/safe_bayesian_optimization.launch.py']; bad=[f for f in files if ('safe_' + 'legged_scouting') in Path(f).read_text()]; raise SystemExit('stale package reference: '+','.join(bad) if bad else 0)"
+    COMMAND ${Python3_EXECUTABLE} test/launch_package_wiring_test.py
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   )
   # the following line skips the linter which checks for copyrights
@@ -182,9 +203,7 @@ if(BUILD_TESTING)
   # comment the line when this package is in a git repo and when
   # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
-  # Existing source files do not currently satisfy the full ament lint suite;
-  # keep colcon test focused on the registered characterization/smoke tests.
-  # Re-enable ament_lint_auto_find_test_dependencies() after lint cleanup.
+  ament_lint_auto_find_test_dependencies()
 endif()
 
 ament_package()
