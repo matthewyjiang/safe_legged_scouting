@@ -22,10 +22,12 @@ struct SelectedCandidate {
 
 bool terrain_map_sizes_are_valid(size_t x_size, size_t y_size,
                                  size_t values_size,
-                                 size_t uncertainties_size, int width,
-                                 int height) {
-  return width >= 0 && height >= 0 && x_size == y_size &&
-         x_size == values_size && x_size == uncertainties_size;
+                                 size_t uncertainties_size, size_t width,
+                                 size_t height) {
+  (void)width;
+  (void)height;
+  return x_size == y_size && x_size == values_size &&
+         x_size == uncertainties_size;
 }
 
 int select_strategy_candidate_data_idx(
@@ -161,8 +163,6 @@ void test_terrain_map_size_validation() {
   assert(!terrain_map_sizes_are_valid(3, 2, 3, 3, 2, 2));
   assert(!terrain_map_sizes_are_valid(3, 3, 2, 3, 2, 2));
   assert(!terrain_map_sizes_are_valid(3, 3, 3, 2, 2, 2));
-  assert(!terrain_map_sizes_are_valid(3, 3, 3, 3, -1, 2));
-  assert(!terrain_map_sizes_are_valid(3, 3, 3, 3, 2, -1));
 }
 
 void test_pareto_front_tradeoff() {

@@ -600,8 +600,8 @@ private:
       const int max_gy = std::max(height - 1, 0);
       gx = static_cast<int>(std::lround(nx * max_gx));
       gy = static_cast<int>(std::lround(ny * max_gy));
-      gx = std::clamp(gx, 0, max_gx);
-      gy = std::clamp(gy, 0, max_gy);
+      gx = std::max(0, std::min(gx, max_gx));
+      gy = std::max(0, std::min(gy, max_gy));
     };
 
     const auto safety_image_start = std::chrono::steady_clock::now();
@@ -721,6 +721,9 @@ private:
 
     const Eigen::VectorXd goal_eigen =
         (Eigen::VectorXd(2) << current_goal_.point.x, current_goal_.point.y)
+            .finished();
+    const Eigen::VectorXd robot_position_eigen =
+        (Eigen::VectorXd(2) << current_robot_position_.x, current_robot_position_.y)
             .finished();
     const Eigen::VectorXd robot_to_candidate_distances =
         (frontier_points.rowwise() - robot_position_eigen.transpose())
@@ -847,99 +850,127 @@ private:
       candidates.push_back(candidate);
     }
 
-    // Take top 25% of closest points
-    size_t top_quarter_size = std::max(size_t(1), distance_pairs.size() / 4);
+    // Sort points by distance to goal for the confidence-width fallback.
+    std::vector<std::pair<double, size_t>> distance_pairs;
+    distance_pairs.reserve(num_frontiers);
+    for (size_t i = 0; i < num_frontiers; ++i) {
+      distance_pairs.emplace_back(goal_distances(i), i);
+    }
+    std::sort(distance_pairs.begin(), distance_pairs.end());
 
-    // Find the point with best confidence width among the closest points
+    std::map<double, CandidateScore> frontier_2d;
+    for (const auto &candidate : candidates) {
+      auto it = frontier_2d.lower_bound(candidate.robot_score);
+      if (it != frontier_2d.end() &&
+          it->second.prob_expansion >= candidate.prob_expansion) {
+        continue;
+      }
+
+      while (it != frontier_2d.begin()) {
+        auto prev = std::prev(it);
+        if (prev->second.prob_expansion <= candidate.prob_expansion) {
+          frontier_2d.erase(prev);
+        } else {
+          break;
+        }
+      }
+
+      if (it != frontier_2d.end() && it->first == candidate.robot_score &&
+          it->second.prob_expansion <= candidate.prob_expansion) {
+        frontier_2d.erase(it);
+      }
+
+      frontier_2d.emplace(candidate.robot_score, candidate);
+    }
+    const auto pareto_end = std::chrono::steady_clock::now();
+
+    // Take top 25% of closest points as a fallback if strategy selection fails.
+    size_t top_quarter_size = std::max(size_t(1), distance_pairs.size() / 4);
     double best_confidence_width = -1.0;
     int best_index = -1;
-
     for (size_t i = 0; i < top_quarter_size; ++i) {
       size_t frontier_idx = distance_pairs[i].second;
       double conf_width = frontier_confidence_width(frontier_idx);
-
       if (conf_width > best_confidence_width) {
         best_confidence_width = conf_width;
         best_index = static_cast<int>(frontier_idx);
       }
-      pareto_end = std::chrono::steady_clock::now();
+    }
 
-      // --- Strategy-specific selection from Pareto front ---
-      if (selection_strategy_ == "alternating_preference") {
-        PreferenceMetric preference = PreferenceMetric::Expansion;
-        const char *preference_name = "expansion";
-        if (goal_received_) {
-          if (preference_order_.empty()) {
-            RCLCPP_WARN(this->get_logger(),
-                        "Preference order is empty; using goal score.");
-            preference_order_ = {PreferenceMetric::Goal};
-            preference_index_ = 0;
-          }
+    const CandidateScore *best = nullptr;
+    double best_metric = -std::numeric_limits<double>::infinity();
+    auto preference_start = std::chrono::steady_clock::now();
+    auto preference_end = preference_start;
 
-          preference =
-              preference_order_[preference_index_ % preference_order_.size()];
-          preference_name = "unknown";
-          switch (preference) {
-          case PreferenceMetric::Goal:
-            preference_name = "goal";
-            break;
-          case PreferenceMetric::Last:
-            preference_name = "last(robot_continuity)";
-            break;
-          case PreferenceMetric::Expansion:
-            preference_name = "expansion";
-            break;
-          }
-          preference_index_ =
-              (preference_index_ + 1) % preference_order_.size();
+    // --- Strategy-specific selection from Pareto front ---
+    if (selection_strategy_ == "alternating_preference") {
+      PreferenceMetric preference = PreferenceMetric::Expansion;
+      const char *preference_name = "expansion";
+      if (goal_received_) {
+        if (preference_order_.empty()) {
+          RCLCPP_WARN(this->get_logger(),
+                      "Preference order is empty; using goal score.");
+          preference_order_ = {PreferenceMetric::Goal};
+          preference_index_ = 0;
         }
-        RCLCPP_INFO(this->get_logger(),
-                    "Selecting subgoal using strategy: alternating_preference, "
-                    "preference: %s",
-                    preference_name);
 
-        preference_start = std::chrono::steady_clock::now();
-        for (const auto &entry : frontier_2d) {
-          const CandidateScore &candidate = entry.second;
-          double metric_value = 0.0;
-          switch (preference) {
-          case PreferenceMetric::Goal:
-            metric_value = candidate.goal_score;
-            break;
-          case PreferenceMetric::Last:
-            metric_value = candidate.robot_score;
-            break;
-          case PreferenceMetric::Expansion:
-            metric_value = candidate.prob_expansion;
-            break;
-          }
-
-          if (!best || metric_value > best_metric) {
-            best = &candidate;
-            best_metric = metric_value;
-          }
+        preference = preference_order_[preference_index_ % preference_order_.size()];
+        preference_name = "unknown";
+        switch (preference) {
+        case PreferenceMetric::Goal:
+          preference_name = "goal";
+          break;
+        case PreferenceMetric::Last:
+          preference_name = "last(robot_continuity)";
+          break;
+        case PreferenceMetric::Expansion:
+          preference_name = "expansion";
+          break;
         }
-        preference_end = std::chrono::steady_clock::now();
-      } else {
-        // "max" strategy: pick Pareto-optimal candidate with highest
-        // overall_score = goal_score * prob_expansion
-        preference_start = std::chrono::steady_clock::now();
-        for (const auto &entry : frontier_2d) {
-          const CandidateScore &candidate = entry.second;
-          const double overall_score =
-              candidate.goal_score * candidate.prob_expansion;
-          if (!best || overall_score > best_metric) {
-            best = &candidate;
-            best_metric = overall_score;
-          }
-        }
-        preference_end = std::chrono::steady_clock::now();
-        RCLCPP_INFO(this->get_logger(),
-                    "Selecting subgoal using strategy: max (overall_score = "
-                    "goal_score * prob_expansion, from %zu Pareto-optimal "
-                    "candidates)",
-                    frontier_2d.size());
+        preference_index_ = (preference_index_ + 1) % preference_order_.size();
       }
+      RCLCPP_INFO(this->get_logger(),
+                  "Selecting subgoal using strategy: alternating_preference, preference: %s",
+                  preference_name);
+
+      preference_start = std::chrono::steady_clock::now();
+      for (const auto &entry : frontier_2d) {
+        const CandidateScore &candidate = entry.second;
+        double metric_value = 0.0;
+        switch (preference) {
+        case PreferenceMetric::Goal:
+          metric_value = candidate.goal_score;
+          break;
+        case PreferenceMetric::Last:
+          metric_value = candidate.robot_score;
+          break;
+        case PreferenceMetric::Expansion:
+          metric_value = candidate.prob_expansion;
+          break;
+        }
+
+        if (!best || metric_value > best_metric) {
+          best = &candidate;
+          best_metric = metric_value;
+        }
+      }
+      preference_end = std::chrono::steady_clock::now();
+    } else {
+      // "max" strategy: pick Pareto-optimal candidate with highest
+      // overall_score = goal_score * prob_expansion
+      preference_start = std::chrono::steady_clock::now();
+      for (const auto &entry : frontier_2d) {
+        const CandidateScore &candidate = entry.second;
+        const double overall_score = candidate.goal_score * candidate.prob_expansion;
+        if (!best || overall_score > best_metric) {
+          best = &candidate;
+          best_metric = overall_score;
+        }
+      }
+      preference_end = std::chrono::steady_clock::now();
+      RCLCPP_INFO(this->get_logger(),
+                  "Selecting subgoal using strategy: max (overall_score = goal_score * prob_expansion, from %zu Pareto-optimal candidates)",
+                  frontier_2d.size());
     }
 
     if (!best) {
@@ -975,6 +1006,9 @@ private:
                   std::chrono::duration_cast<std::chrono::milliseconds>(
                       preference_end - start)
                       .count());
+      if (best_index >= 0) {
+        return candidate_indices[best_index];
+      }
       return frontier_indices.front();
     }
 
@@ -1083,13 +1117,6 @@ private:
     const size_t y_size = response->y_coords.size();
     const size_t values_size = response->values.size();
     const size_t uncertainties_size = response->uncertainties.size();
-
-    if (response->n_width_cells < 0 || response->n_height_cells < 0) {
-      RCLCPP_WARN(this->get_logger(),
-                  "Rejecting terrain map with negative dimensions: width=%d, height=%d",
-                  response->n_width_cells, response->n_height_cells);
-      return false;
-    }
 
     if (x_size != y_size || x_size != values_size ||
         x_size != uncertainties_size) {
@@ -1409,25 +1436,6 @@ private:
                   "[MAIN] No safe points available for polygon generation");
       return;
     }
-
-    // Create polygons with holes using OpenCV contours (more efficient than Alpha Shapes)
-    RCLCPP_INFO(this->get_logger(), "[MAIN] Creating safe region polygons from contours...");
-
-    // Find grid bounds
-    double min_x = D_.col(0).minCoeff();
-    double max_x = D_.col(0).maxCoeff();
-    double min_y = D_.col(1).minCoeff();
-    double max_y = D_.col(1).maxCoeff();
-
-    // Use stored grid dimensions from service response
-    int width = terrain_width_cells_;
-    int height = terrain_height_cells_;
-
-    RCLCPP_INFO(this->get_logger(), "[MAIN] Grid bounds: X=[%.2f, %.2f], Y=[%.2f, %.2f], size=%dx%d",
-                min_x, max_x, min_y, max_y, width, height);
-
-    // Create binary image from safety data
-    cv::Mat safety_image = cv::Mat::zeros(height, width, CV_8UC1);
 
     // Create polygons with holes using OpenCV contours (more efficient than Alpha Shapes)
     RCLCPP_INFO(this->get_logger(), "[MAIN] Creating safe region polygons from contours...");
