@@ -89,6 +89,17 @@ colcon build --cmake-args -DBUILD_EXAMPLES=OFF
 source install/setup.bash
 ```
 
+## Test
+
+After building the package, run the lint and characterization tests:
+
+```bash
+colcon test --packages-select safe_bayesian_optimization
+colcon test-result --verbose
+```
+
+This includes the subgoal preference characterization test.
+
 ## Run
 
 ### Turtlesim / local scouting demo

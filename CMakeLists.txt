@@ -71,7 +71,18 @@ add_executable(reactive_navigation_node src/reactive_navigation_node.cpp)
 
 # Add dependencies
 ament_target_dependencies(
-    safe_bayesian_optimization_node rclcpp trusses_custom_interfaces Eigen3 geometry_msgs sensor_msgs std_msgs cv_bridge Boost OpenCV CGAL visualization_msgs
+  safe_bayesian_optimization_node
+  rclcpp
+  trusses_custom_interfaces
+  Eigen3
+  geometry_msgs
+  sensor_msgs
+  std_msgs
+  cv_bridge
+  Boost
+  OpenCV
+  CGAL
+  visualization_msgs
 )
 
 target_link_libraries(reactive_planner
@@ -113,7 +124,18 @@ ament_target_dependencies(
 )
 
 ament_target_dependencies(
-    reactive_navigation_node rclcpp geometry_msgs nav_msgs sensor_msgs std_msgs tf2 tf2_ros tf2_geometry_msgs Boost turtlesim visualization_msgs
+  reactive_navigation_node
+  rclcpp
+  geometry_msgs
+  nav_msgs
+  sensor_msgs
+  std_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+  Boost
+  turtlesim
+  visualization_msgs
 )
 
 ament_target_dependencies(
@@ -163,6 +185,17 @@ install(DIRECTORY
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+  add_executable(subgoal_preference_test src/subgoal_preference_test.cpp)
+  target_link_libraries(subgoal_preference_test Eigen3::Eigen)
+  add_test(NAME subgoal_preference_test COMMAND subgoal_preference_test)
+
+  add_test(
+    NAME launch_package_wiring
+    COMMAND ${Python3_EXECUTABLE} test/launch_package_wiring_test.py
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files
   set(ament_cmake_copyright_FOUND TRUE)

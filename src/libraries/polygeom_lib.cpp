@@ -25,8 +25,10 @@
 #include <polygeom_lib.h>
 
 std::vector<std::vector<double>>
-MatrixMatrixMultiplication(std::vector<std::vector<double>> Matrix1,
-                           std::vector<std::vector<double>> Matrix2) {
+MatrixMatrixMultiplication(
+  std::vector<std::vector<double>> Matrix1,
+  std::vector<std::vector<double>> Matrix2)
+{
   std::vector<std::vector<double>> MatrixOut = {{0.0, 0.0}, {0.0, 0.0}};
   for (size_t i = 0; i < Matrix1.size(); i++) {
     for (size_t j = 0; j < Matrix2.size(); j++) {
@@ -39,8 +41,10 @@ MatrixMatrixMultiplication(std::vector<std::vector<double>> Matrix1,
 }
 
 std::vector<double>
-MatrixVectorMultiplication(std::vector<std::vector<double>> Matrix,
-                           std::vector<double> Vector) {
+MatrixVectorMultiplication(
+  std::vector<std::vector<double>> Matrix,
+  std::vector<double> Vector)
+{
   std::vector<double> VectorOut = {0.0, 0.0};
   for (size_t i = 0; i < Matrix.size(); i++) {
     for (size_t j = 0; j < Vector.size(); j++) {
@@ -51,7 +55,8 @@ MatrixVectorMultiplication(std::vector<std::vector<double>> Matrix,
 }
 
 std::vector<std::vector<double>>
-VectorOuterProduct(std::vector<double> Vector1, std::vector<double> Vector2) {
+VectorOuterProduct(std::vector<double> Vector1, std::vector<double> Vector2)
+{
   std::vector<std::vector<double>> MatrixOut = {{0.0, 0.0}, {0.0, 0.0}};
   for (size_t i = 0; i < Vector1.size(); i++) {
     for (size_t j = 0; j < Vector2.size(); j++) {
@@ -61,11 +66,13 @@ VectorOuterProduct(std::vector<double> Vector1, std::vector<double> Vector2) {
   return MatrixOut;
 }
 
-double MatrixDeterminant(std::vector<std::vector<double>> Matrix) {
-  return (Matrix[0][0] * Matrix[1][1] - Matrix[0][1] * Matrix[1][0]);
+double MatrixDeterminant(std::vector<std::vector<double>> Matrix)
+{
+  return Matrix[0][0] * Matrix[1][1] - Matrix[0][1] * Matrix[1][0];
 }
 
-std::vector<point> StdToBoostPoint(std::vector<std::vector<double>> input) {
+std::vector<point> StdToBoostPoint(std::vector<std::vector<double>> input)
+{
   /**
    * Function that takes as input an array of points in
    * std::vector<std::vector<double>> format and converts them to
@@ -85,7 +92,8 @@ std::vector<point> StdToBoostPoint(std::vector<std::vector<double>> input) {
   return output;
 }
 
-std::vector<std::vector<double>> BoostPointToStd(std::vector<point> input) {
+std::vector<std::vector<double>> BoostPointToStd(std::vector<point> input)
+{
   /**
    * Function that takes as input an array of points in std::vector<point>
    * format and converts them to std::vector<std::vector<double>>
@@ -104,7 +112,8 @@ std::vector<std::vector<double>> BoostPointToStd(std::vector<point> input) {
   return output;
 }
 
-std::vector<point> BoostPolyToBoostPoint(polygon input) {
+std::vector<point> BoostPolyToBoostPoint(polygon input)
+{
   /**
    * Function that takes as input a polygon in Boost format and converts it to
    * std::vector<point>
@@ -117,7 +126,8 @@ std::vector<point> BoostPolyToBoostPoint(polygon input) {
    */
   std::vector<point> output;
   for (auto it = boost::begin(bg::exterior_ring(input));
-       it != boost::end(bg::exterior_ring(input)); ++it) {
+    it != boost::end(bg::exterior_ring(input)); ++it)
+  {
     point new_point = point(bg::get<0>(*it), bg::get<1>(*it));
     output.push_back(new_point);
   }
@@ -125,7 +135,8 @@ std::vector<point> BoostPolyToBoostPoint(polygon input) {
   return output;
 }
 
-std::vector<point> BoostLineToBoostPoint(line input) {
+std::vector<point> BoostLineToBoostPoint(line input)
+{
   /**
    * Function that takes as input a line in Boost format and converts it to
    * std::vector<point>
@@ -145,7 +156,8 @@ std::vector<point> BoostLineToBoostPoint(line input) {
   return output;
 }
 
-polygon BoostPointToBoostPoly(std::vector<point> input) {
+polygon BoostPointToBoostPoly(std::vector<point> input)
+{
   /**
    * Function that takes as input a std::vector<point> series of points and
    * converts them to Boost polygon format
@@ -167,7 +179,8 @@ polygon BoostPointToBoostPoly(std::vector<point> input) {
   return output;
 }
 
-line BoostPointToBoostLine(std::vector<point> input) {
+line BoostPointToBoostLine(std::vector<point> input)
+{
   /**
    * Function that takes as input a std::vector<point> series of points and
    * converts them to Boost line format
@@ -186,7 +199,8 @@ line BoostPointToBoostLine(std::vector<point> input) {
   return output;
 }
 
-double angle_transformation(double input_angle) {
+double angle_transformation(double input_angle)
+{
   /**
    * Function that takes as input an angle and converts it to an angle between
    * -M_PI and M_PI
@@ -206,7 +220,8 @@ double angle_transformation(double input_angle) {
   return output;
 }
 
-polygon cvxpolyxhplane(polygon xy, point m, point n) {
+polygon cvxpolyxhplane(polygon xy, point m, point n)
+{
   /**
    * Function that computes the the intersection of a polygon, with vertex
    * coordinates xy, and a halfplane, defined by a boundary point m and the
@@ -232,16 +247,17 @@ polygon cvxpolyxhplane(polygon xy, point m, point n) {
 
   // Get list of points for the polygon and erase the last element
   std::vector<std::vector<double>> VertexList =
-      BoostPointToStd(BoostPolyToBoostPoint(xy));
+    BoostPointToStd(BoostPolyToBoostPoint(xy));
   VertexList.pop_back();
 
   // Compute distance of polygon vertices to the halfspace boundary
-  n = point(n.get<0>() / bg::distance(n, origin),
-            n.get<1>() / bg::distance(n, origin)); // Normalize once again
+  n = point(
+    n.get<0>() / bg::distance(n, origin),
+    n.get<1>() / bg::distance(n, origin));         // Normalize once again
   std::vector<double> dist2hplane(VertexList.size(), 0.0);
   for (size_t i = 0; i < VertexList.size(); i++) {
     dist2hplane[i] = (VertexList[i][0] - m.get<0>()) * n.get<0>() +
-                     (VertexList[i][1] - m.get<1>()) * n.get<1>();
+      (VertexList[i][1] - m.get<1>()) * n.get<1>();
   }
 
   std::vector<point> VertexListNew;
@@ -253,11 +269,11 @@ polygon cvxpolyxhplane(polygon xy, point m, point n) {
       // Compute the point on the boundary and include it into the new vertex
       // list
       double w = ((m.get<0>() - VertexList[cn][0]) * n.get<0>() +
-                  (m.get<1>() - VertexList[cn][1]) * n.get<1>()) /
-                 ((VertexList[ck][0] - VertexList[cn][0]) * n.get<0>() +
-                  (VertexList[ck][1] - VertexList[cn][1]) * n.get<1>());
+        (m.get<1>() - VertexList[cn][1]) * n.get<1>()) /
+        ((VertexList[ck][0] - VertexList[cn][0]) * n.get<0>() +
+        (VertexList[ck][1] - VertexList[cn][1]) * n.get<1>());
       point b(w * VertexList[ck][0] + (1 - w) * VertexList[cn][0],
-              w * VertexList[ck][1] + (1 - w) * VertexList[cn][1]);
+        w * VertexList[ck][1] + (1 - w) * VertexList[cn][1]);
       VertexListNew.push_back(b);
     }
 
@@ -278,7 +294,8 @@ polygon cvxpolyxhplane(polygon xy, point m, point n) {
   return xyNew;
 }
 
-line polyxline(polygon xy, point m, point n) {
+line polyxline(polygon xy, point m, point n)
+{
   /**
    * Function that computes the the intersection of a polygon, with vertex
    * coordinates xy, and a line, defined by a point m on the line and the normal
@@ -304,18 +321,18 @@ line polyxline(polygon xy, point m, point n) {
 
   // Get list of points for the polygon and erase the last element
   std::vector<std::vector<double>> VertexList =
-      BoostPointToStd(BoostPolyToBoostPoint(xy));
+    BoostPointToStd(BoostPolyToBoostPoint(xy));
   VertexList.pop_back();
 
   // Normalize the input vector
   n = {n.get<0>() / bg::distance(n, origin),
-       n.get<1>() / bg::distance(n, origin)};
+    n.get<1>() / bg::distance(n, origin)};
 
   // Find distance of all vertices to line
   std::vector<double> dist2line(VertexList.size(), 0.0);
   for (size_t i = 0; i < VertexList.size(); i++) {
     dist2line[i] = (VertexList[i][0] - m.get<0>()) * n.get<0>() +
-                   (VertexList[i][1] - m.get<1>()) * n.get<1>();
+      (VertexList[i][1] - m.get<1>()) * n.get<1>();
   }
 
   std::vector<point> VertexListNew;
@@ -328,7 +345,7 @@ line polyxline(polygon xy, point m, point n) {
       if (dist2line[ck] * dist2line[cn] < 0.0) {
         double a = -dist2line[cn] / (dist2line[ck] - dist2line[cn]);
         point b(a * VertexList[ck][0] + (1 - a) * VertexList[cn][0],
-                a * VertexList[ck][1] + (1 - a) * VertexList[cn][1]);
+          a * VertexList[ck][1] + (1 - a) * VertexList[cn][1]);
         VertexListNew.push_back(b);
       }
     }
@@ -339,7 +356,8 @@ line polyxline(polygon xy, point m, point n) {
   return output;
 }
 
-point polyxray(polygon xy, point b, point v) {
+point polyxray(polygon xy, point b, point v)
+{
   /**
    * Function that computes the the intersection of a polygon, with vertex
    * coordinates xy, and a ray, defined by a base point b and the direction
@@ -365,12 +383,12 @@ point polyxray(polygon xy, point b, point v) {
 
   // Get list of points for the polygon and erase the last element
   std::vector<std::vector<double>> VertexList =
-      BoostPointToStd(BoostPolyToBoostPoint(xy));
+    BoostPointToStd(BoostPolyToBoostPoint(xy));
   VertexList.pop_back();
 
   // Normalize the input vector
   v = {v.get<0>() / bg::distance(v, origin),
-       v.get<1>() / bg::distance(v, origin)};
+    v.get<1>() / bg::distance(v, origin)};
 
   // Get normal vector
   point vn(-v.get<1>(), v.get<0>());
@@ -383,9 +401,9 @@ point polyxray(polygon xy, point b, point v) {
     return b;
   }
   std::vector<double> a = {(cvector[0].get<0>() - b.get<0>()) * v.get<0>() +
-                               (cvector[0].get<1>() - b.get<1>()) * v.get<1>(),
-                           (cvector[1].get<0>() - b.get<0>()) * v.get<0>() +
-                               (cvector[1].get<1>() - b.get<1>()) * v.get<1>()};
+    (cvector[0].get<1>() - b.get<1>()) * v.get<1>(),
+    (cvector[1].get<0>() - b.get<0>()) * v.get<0>() +
+    (cvector[1].get<1>() - b.get<1>()) * v.get<1>()};
 
   if ((a[0] > 0.0) && (a[1] <= 0.0)) {
     output = point(cvector[0].get<0>(), cvector[0].get<1>());
@@ -398,7 +416,8 @@ point polyxray(polygon xy, point b, point v) {
   return output;
 }
 
-ProjectionResultStruct polydist(polygon xy, point p) {
+ProjectionResultStruct polydist(polygon xy, point p)
+{
   /**
    * Function that computes the distance between a point p and a polygon xy and
    * returns the closest point on the polygon boundary
@@ -427,7 +446,7 @@ ProjectionResultStruct polydist(polygon xy, point p) {
 
   // Get list of points for the polygon and erase the last element
   std::vector<std::vector<double>> VertexList =
-      BoostPointToStd(BoostPolyToBoostPoint(xy));
+    BoostPointToStd(BoostPolyToBoostPoint(xy));
   VertexList.pop_back();
 
   // Construct a new list with all the vertices rolled forward by 1
@@ -439,7 +458,7 @@ ProjectionResultStruct polydist(polygon xy, point p) {
     size_t j = (i + 1) % numVertex;
     VertexListRolled[j] = {VertexList[j][0], VertexList[j][1]};
     dxy[j] = {VertexList[j][0] - VertexList[i][0],
-              VertexList[j][1] - VertexList[i][1]};
+      VertexList[j][1] - VertexList[i][1]};
     diff_norm[j] = bg::distance(point(dxy[j][0], dxy[j][1]), origin);
     if (diff_norm[j] == 0.0) {
       diff_norm[j] = 1.0;
@@ -452,18 +471,18 @@ ProjectionResultStruct polydist(polygon xy, point p) {
   std::vector<std::vector<double>> ctemp(numVertex, {0.0, 0.0});
   for (size_t i = 0; i < numVertex; i++) {
     double w_temp =
-        (PointCoord[0] - VertexList[i][0]) *
-            (dxy[i][0] / pow(diff_norm[i], 2)) +
-        (PointCoord[1] - VertexList[i][1]) * (dxy[i][1] / pow(diff_norm[i], 2));
+      (PointCoord[0] - VertexList[i][0]) *
+      (dxy[i][0] / pow(diff_norm[i], 2)) +
+      (PointCoord[1] - VertexList[i][1]) * (dxy[i][1] / pow(diff_norm[i], 2));
     w[i] = std::max(std::min(w_temp, 1.0), 0.0);
     ctemp[i] = {(1 - w[i]) * VertexList[i][0] + w[i] * VertexListRolled[i][0],
-                (1 - w[i]) * VertexList[i][1] + w[i] * VertexListRolled[i][1]};
+      (1 - w[i]) * VertexList[i][1] + w[i] * VertexListRolled[i][1]};
     dtemp[i] = bg::distance(p, point(ctemp[i][0], ctemp[i][1]));
   }
 
   // Find the minimum distance and extract the corresponding point
   size_t dist_argmin = std::distance(
-      dtemp.begin(), std::min_element(dtemp.begin(), dtemp.end()));
+    dtemp.begin(), std::min_element(dtemp.begin(), dtemp.end()));
   double dist = dtemp[dist_argmin];
   std::vector<double> projected_point = ctemp[dist_argmin];
 
@@ -473,7 +492,8 @@ ProjectionResultStruct polydist(polygon xy, point p) {
   return output;
 }
 
-ProjectionResultStruct linedist(line xy, point p) {
+ProjectionResultStruct linedist(line xy, point p)
+{
   /**
    * Function that computes the distance between a point p and a line xy and
    * returns the closest point on the line
@@ -502,7 +522,7 @@ ProjectionResultStruct linedist(line xy, point p) {
 
   // Get list of points for the polygon and erase the last element
   std::vector<std::vector<double>> VertexList =
-      BoostPointToStd(BoostLineToBoostPoint(xy));
+    BoostPointToStd(BoostLineToBoostPoint(xy));
 
   // Construct a new list with all the vertices rolled forward by 1
   size_t numEdge = VertexList.size() - 1;
@@ -510,7 +530,7 @@ ProjectionResultStruct linedist(line xy, point p) {
   std::vector<double> diff_norm(numEdge, 0.0);
   for (size_t i = 0; i < numEdge; i++) {
     dxy[i] = {VertexList[i + 1][0] - VertexList[i][0],
-              VertexList[i + 1][1] - VertexList[i][1]};
+      VertexList[i + 1][1] - VertexList[i][1]};
     diff_norm[i] = bg::distance(point(dxy[i][0], dxy[i][1]), origin);
     if (diff_norm[i] == 0.0) {
       diff_norm[i] = 1.0;
@@ -523,18 +543,18 @@ ProjectionResultStruct linedist(line xy, point p) {
   std::vector<std::vector<double>> ctemp(numEdge, {0.0, 0.0});
   for (size_t i = 0; i < numEdge; i++) {
     double w_temp =
-        (PointCoord[0] - VertexList[i][0]) *
-            (dxy[i][0] / pow(diff_norm[i], 2)) +
-        (PointCoord[1] - VertexList[i][1]) * (dxy[i][1] / pow(diff_norm[i], 2));
+      (PointCoord[0] - VertexList[i][0]) *
+      (dxy[i][0] / pow(diff_norm[i], 2)) +
+      (PointCoord[1] - VertexList[i][1]) * (dxy[i][1] / pow(diff_norm[i], 2));
     w[i] = std::max(std::min(w_temp, 1.0), 0.0);
     ctemp[i] = {(1 - w[i]) * VertexList[i][0] + w[i] * VertexList[i + 1][0],
-                (1 - w[i]) * VertexList[i][1] + w[i] * VertexList[i + 1][1]};
+      (1 - w[i]) * VertexList[i][1] + w[i] * VertexList[i + 1][1]};
     dtemp[i] = bg::distance(p, point(ctemp[i][0], ctemp[i][1]));
   }
 
   // Find the minimum distance and extract the corresponding point
   size_t dist_argmin = std::distance(
-      dtemp.begin(), std::min_element(dtemp.begin(), dtemp.end()));
+    dtemp.begin(), std::min_element(dtemp.begin(), dtemp.end()));
   double dist = dtemp[dist_argmin];
   std::vector<double> projected_point = ctemp[dist_argmin];
 
@@ -544,10 +564,12 @@ ProjectionResultStruct linedist(line xy, point p) {
   return output;
 }
 
-void polytriangulation(std::vector<std::vector<double>> xy,
-                       std::vector<std::vector<double>> workspace,
-                       bool touching_boundary,
-                       std::vector<TriangleClass> *tree) {
+void polytriangulation(
+  std::vector<std::vector<double>> xy,
+  std::vector<std::vector<double>> workspace,
+  bool touching_boundary,
+  std::vector<TriangleClass> * tree)
+{
   /**
    * Compute the triangulation of the input polygon and its dual (adjacency)
    * graph.
@@ -587,36 +609,45 @@ void polytriangulation(std::vector<std::vector<double>> xy,
   // Populate an initial list of triangles
   std::vector<std::vector<std::vector<double>>> triangle_list;
   for (size_t i = 0; i < indices.size(); i = i + 3) {
-    triangle_list.push_back({{xy[indices[i]][0], xy[indices[i]][1]},
-                             {xy[indices[i + 1]][0], xy[indices[i + 1]][1]},
-                             {xy[indices[i + 2]][0], xy[indices[i + 2]][1]}});
+    triangle_list.push_back(
+      {{xy[indices[i]][0], xy[indices[i]][1]},
+        {xy[indices[i + 1]][0], xy[indices[i + 1]][1]},
+        {xy[indices[i + 2]][0], xy[indices[i + 2]][1]}});
   }
 
   // Sort triangles - Area if not touching boundary, Min distance to boundary if
   // touching boundary
   if (!touching_boundary) {
     // Create comparator for area
-    struct area_comparator {
-      bool operator()(const std::vector<std::vector<double>> a,
-                      const std::vector<std::vector<double>> b) {
-        return (bg::area(BoostPointToBoostPoly(StdToBoostPoint(a))) >
-                bg::area(BoostPointToBoostPoly(StdToBoostPoint(b))));
+    struct area_comparator
+    {
+      bool operator()(
+        const std::vector<std::vector<double>> a,
+        const std::vector<std::vector<double>> b)
+      {
+        return bg::area(BoostPointToBoostPoly(StdToBoostPoint(a))) >
+               bg::area(BoostPointToBoostPoly(StdToBoostPoint(b)));
       }
     };
 
     // Create comparator for distance
-    class distance_comparator {
+    class distance_comparator
+    {
       point robotposition_;
 
-    public:
+public:
       distance_comparator(point robotposition)
-          : robotposition_(robotposition) {}
-      bool operator()(const std::vector<std::vector<double>> a,
-                      const std::vector<std::vector<double>> b) {
-        return (bg::distance(robotposition_,
-                             BoostPointToBoostPoly(StdToBoostPoint(a))) >
-                bg::distance(robotposition_,
-                             BoostPointToBoostPoly(StdToBoostPoint(b))));
+      : robotposition_(robotposition) {}
+      bool operator()(
+        const std::vector<std::vector<double>> a,
+        const std::vector<std::vector<double>> b)
+      {
+        return bg::distance(
+          robotposition_,
+          BoostPointToBoostPoly(StdToBoostPoint(a))) >
+               bg::distance(
+          robotposition_,
+          BoostPointToBoostPoly(StdToBoostPoint(b)));
       }
     };
 
@@ -629,24 +660,30 @@ void polytriangulation(std::vector<std::vector<double>> xy,
       workspaceLine.push_back(point(workspace[i][0], workspace[i][1]));
     }
     // Create comparator for distance to the boundary
-    class boundary_distance_comparator {
+    class boundary_distance_comparator
+    {
       line workspaceLine_;
 
-    public:
+public:
       boundary_distance_comparator(line workspaceLine)
-          : workspaceLine_(workspaceLine) {}
-      bool operator()(const std::vector<std::vector<double>> a,
-                      const std::vector<std::vector<double>> b) {
-        return (bg::distance(BoostPointToBoostPoly(StdToBoostPoint(a)),
-                             workspaceLine_) <
-                bg::distance(BoostPointToBoostPoly(StdToBoostPoint(b)),
-                             workspaceLine_));
+      : workspaceLine_(workspaceLine) {}
+      bool operator()(
+        const std::vector<std::vector<double>> a,
+        const std::vector<std::vector<double>> b)
+      {
+        return bg::distance(
+          BoostPointToBoostPoly(StdToBoostPoint(a)),
+          workspaceLine_) <
+               bg::distance(
+          BoostPointToBoostPoly(StdToBoostPoint(b)),
+          workspaceLine_);
       }
     };
 
     // Sort in order of ascending distance to the boundary
-    std::sort(triangle_list.begin(), triangle_list.end(),
-              boundary_distance_comparator(workspaceLine));
+    std::sort(
+      triangle_list.begin(), triangle_list.end(),
+      boundary_distance_comparator(workspaceLine));
   }
 
   // Construct the first node of the tree that will act as the root
@@ -676,38 +713,49 @@ void polytriangulation(std::vector<std::vector<double>> xy,
       // collisions
       std::vector<point> expanded_node_vertices = expanded_node.get_vertices();
       std::vector<std::vector<point>> polygon1_edges, polygon2_edges;
-      polygon1_edges.push_back({point(expanded_node_vertices[0].get<0>(),
-                                      expanded_node_vertices[0].get<1>()),
-                                point(expanded_node_vertices[1].get<0>(),
-                                      expanded_node_vertices[1].get<1>())});
-      polygon1_edges.push_back({point(expanded_node_vertices[1].get<0>(),
-                                      expanded_node_vertices[1].get<1>()),
-                                point(expanded_node_vertices[2].get<0>(),
-                                      expanded_node_vertices[2].get<1>())});
-      polygon1_edges.push_back({point(expanded_node_vertices[2].get<0>(),
-                                      expanded_node_vertices[2].get<1>()),
-                                point(expanded_node_vertices[0].get<0>(),
-                                      expanded_node_vertices[0].get<1>())});
+      polygon1_edges.push_back(
+        {point(
+            expanded_node_vertices[0].get<0>(),
+            expanded_node_vertices[0].get<1>()),
+          point(
+            expanded_node_vertices[1].get<0>(),
+            expanded_node_vertices[1].get<1>())});
+      polygon1_edges.push_back(
+        {point(
+            expanded_node_vertices[1].get<0>(),
+            expanded_node_vertices[1].get<1>()),
+          point(
+            expanded_node_vertices[2].get<0>(),
+            expanded_node_vertices[2].get<1>())});
+      polygon1_edges.push_back(
+        {point(
+            expanded_node_vertices[2].get<0>(),
+            expanded_node_vertices[2].get<1>()),
+          point(
+            expanded_node_vertices[0].get<0>(),
+            expanded_node_vertices[0].get<1>())});
       polygon2_edges.push_back(
-          {point(triangle_list[i][0][0], triangle_list[i][0][1]),
-           point(triangle_list[i][2][0], triangle_list[i][2][1])});
+        {point(triangle_list[i][0][0], triangle_list[i][0][1]),
+          point(triangle_list[i][2][0], triangle_list[i][2][1])});
       polygon2_edges.push_back(
-          {point(triangle_list[i][2][0], triangle_list[i][2][1]),
-           point(triangle_list[i][1][0], triangle_list[i][1][1])});
+        {point(triangle_list[i][2][0], triangle_list[i][2][1]),
+          point(triangle_list[i][1][0], triangle_list[i][1][1])});
       polygon2_edges.push_back(
-          {point(triangle_list[i][1][0], triangle_list[i][1][1]),
-           point(triangle_list[i][0][0], triangle_list[i][0][1])});
+        {point(triangle_list[i][1][0], triangle_list[i][1][1]),
+          point(triangle_list[i][0][0], triangle_list[i][0][1])});
       bool triangles_touch = false;
       size_t adj_edge_index = -1;
       for (size_t polygon1_edge_index = 0;
-           polygon1_edge_index < polygon1_edges.size(); polygon1_edge_index++) {
+        polygon1_edge_index < polygon1_edges.size(); polygon1_edge_index++)
+      {
         for (size_t polygon2_edge_index = 0;
-             polygon2_edge_index < polygon2_edges.size();
-             polygon2_edge_index++) {
+          polygon2_edge_index < polygon2_edges.size();
+          polygon2_edge_index++)
+        {
           line line1 =
-              BoostPointToBoostLine(polygon1_edges[polygon1_edge_index]);
+            BoostPointToBoostLine(polygon1_edges[polygon1_edge_index]);
           line line2 =
-              BoostPointToBoostLine(polygon2_edges[polygon2_edge_index]);
+            BoostPointToBoostLine(polygon2_edges[polygon2_edge_index]);
           if (bg::equals(line1, line2)) {
             triangles_touch = true;
             adj_edge_index = polygon2_edge_index;
@@ -736,21 +784,22 @@ void polytriangulation(std::vector<std::vector<double>> xy,
         // shared edge) and arrange the vertices so that this is the 3rd vertex
         size_t third_vertex_index;
         switch (adj_edge_index) {
-        case 0:
-          third_vertex_index = 1;
-          break;
-        case 1:
-          third_vertex_index = 0;
-          break;
-        case 2:
-          third_vertex_index = 2;
-          break;
+          case 0:
+            third_vertex_index = 1;
+            break;
+          case 1:
+            third_vertex_index = 0;
+            break;
+          case 2:
+            third_vertex_index = 2;
+            break;
         }
         new_triangle.set_vertices(
-            {polygon2_edges[adj_edge_index][1],
-             polygon2_edges[adj_edge_index][0],
-             point(triangle_list[i][third_vertex_index][0],
-                   triangle_list[i][third_vertex_index][1])});
+          {polygon2_edges[adj_edge_index][1],
+            polygon2_edges[adj_edge_index][0],
+            point(
+              triangle_list[i][third_vertex_index][0],
+              triangle_list[i][third_vertex_index][1])});
 
         // Delete the child from the input stack and append it to the stack to
         // be expanded
@@ -764,9 +813,11 @@ void polytriangulation(std::vector<std::vector<double>> xy,
   }
 
   // Create comparator for depth
-  struct depth_comparator {
-    bool operator()(const TriangleClass a, const TriangleClass b) {
-      return (a.get_depth() > b.get_depth());
+  struct depth_comparator
+  {
+    bool operator()(const TriangleClass a, const TriangleClass b)
+    {
+      return a.get_depth() > b.get_depth();
     }
   };
 
@@ -785,9 +836,9 @@ void polytriangulation(std::vector<std::vector<double>> xy,
   // Update indices and predecessors appropriately
   for (size_t i = 0; i < tree->size() - 1; i++) {
     std::vector<size_t>::iterator it = std::find(
-        indices_old.begin(), indices_old.end(), (*tree)[i].get_predecessor());
+      indices_old.begin(), indices_old.end(), (*tree)[i].get_predecessor());
     (*tree)[i].set_predecessor(
-        indices_new[std::distance(indices_old.begin(), it)]);
+      indices_new[std::distance(indices_old.begin(), it)]);
     (*tree)[i].set_index(i);
   }
   (*tree)[tree->size() - 1].set_index(tree->size() - 1);
@@ -795,10 +846,12 @@ void polytriangulation(std::vector<std::vector<double>> xy,
   return;
 }
 
-void polyconvexdecomposition(std::vector<std::vector<double>> xy,
-                             std::vector<std::vector<double>> workspace,
-                             bool touching_boundary,
-                             std::vector<PolygonClass> *tree) {
+void polyconvexdecomposition(
+  std::vector<std::vector<double>> xy,
+  std::vector<std::vector<double>> workspace,
+  bool touching_boundary,
+  std::vector<PolygonClass> * tree)
+{
   /**
    * Compute the convex decomposition of the input polygon and its dual
    * (adjacency) graph.
@@ -827,9 +880,10 @@ void polyconvexdecomposition(std::vector<std::vector<double>> xy,
   // Find convex decomposition
   std::vector<std::vector<std::vector<double>>> polygon_list;
   CGAL::optimal_convex_partition_2(
-      cgal_polygon.vertices_begin(), cgal_polygon.vertices_end(),
-      std::back_inserter(partition_polys), partition_traits);
-  assert(CGAL::convex_partition_is_valid_2(
+    cgal_polygon.vertices_begin(), cgal_polygon.vertices_end(),
+    std::back_inserter(partition_polys), partition_traits);
+  assert(
+    CGAL::convex_partition_is_valid_2(
       cgal_polygon.vertices_begin(), cgal_polygon.vertices_end(),
       partition_polys.begin(), partition_polys.end(), partition_traits));
 
@@ -839,7 +893,7 @@ void polyconvexdecomposition(std::vector<std::vector<double>> xy,
     std::vector<point> next_polygon_vertices = {};
     for (size_t l = 0; l < next_polygon.size(); l++) {
       next_polygon_vertices.push_back(
-          point(next_polygon.vertex(l).x(), next_polygon.vertex(l).y()));
+        point(next_polygon.vertex(l).x(), next_polygon.vertex(l).y()));
     }
     polygon_list.push_back(BoostPointToStd(next_polygon_vertices));
   }
@@ -848,11 +902,14 @@ void polyconvexdecomposition(std::vector<std::vector<double>> xy,
   // touching boundary
   if (!touching_boundary) {
     // Create comparator for area
-    struct area_comparator {
-      bool operator()(const std::vector<std::vector<double>> a,
-                      const std::vector<std::vector<double>> b) {
-        return (bg::area(BoostPointToBoostPoly(StdToBoostPoint(a))) >
-                bg::area(BoostPointToBoostPoly(StdToBoostPoint(b))));
+    struct area_comparator
+    {
+      bool operator()(
+        const std::vector<std::vector<double>> a,
+        const std::vector<std::vector<double>> b)
+      {
+        return bg::area(BoostPointToBoostPoly(StdToBoostPoint(a))) >
+               bg::area(BoostPointToBoostPoly(StdToBoostPoint(b)));
       }
     };
 
@@ -865,14 +922,17 @@ void polyconvexdecomposition(std::vector<std::vector<double>> xy,
       workspaceLine.push_back(point(workspace[i][0], workspace[i][1]));
     }
     // Create comparator for distance to the boundary
-    class boundary_distance_comparator {
+    class boundary_distance_comparator
+    {
       line workspaceLine_;
 
-    public:
+public:
       boundary_distance_comparator(line workspaceLine)
-          : workspaceLine_(workspaceLine) {}
-      bool operator()(const std::vector<std::vector<double>> a,
-                      const std::vector<std::vector<double>> b) {
+      : workspaceLine_(workspaceLine) {}
+      bool operator()(
+        const std::vector<std::vector<double>> a,
+        const std::vector<std::vector<double>> b)
+      {
         double size_a = static_cast<double>(a.size());
         double size_b = static_cast<double>(b.size());
         double sum_a = 0.0;
@@ -893,13 +953,14 @@ void polyconvexdecomposition(std::vector<std::vector<double>> xy,
         }
         double normalized_a = sum_a / size_a;
         double normalized_b = sum_b / size_b;
-        return (boundary_a / normalized_a > boundary_b / normalized_b);
+        return boundary_a / normalized_a > boundary_b / normalized_b;
       }
     };
 
     // Sort in order of ascending distance to the boundary
-    std::sort(polygon_list.begin(), polygon_list.end(),
-              boundary_distance_comparator(workspaceLine));
+    std::sort(
+      polygon_list.begin(), polygon_list.end(),
+      boundary_distance_comparator(workspaceLine));
   }
 
   // Construct the first node of the tree that will act as the root
@@ -928,14 +989,16 @@ void polyconvexdecomposition(std::vector<std::vector<double>> xy,
     std::vector<std::vector<point>> polygon1_edges;
     for (size_t j = 0; j < expanded_node_vertices.size(); j++) {
       polygon1_edges.push_back(
-          {point(expanded_node_vertices[(j + 1) % expanded_node_vertices.size()]
-                     .get<0>(),
-                 expanded_node_vertices[(j + 1) % expanded_node_vertices.size()]
-                     .get<1>()),
-           point(expanded_node_vertices[j % expanded_node_vertices.size()]
-                     .get<0>(),
-                 expanded_node_vertices[j % expanded_node_vertices.size()]
-                     .get<1>())});
+        {point(
+            expanded_node_vertices[(j + 1) % expanded_node_vertices.size()]
+            .get<0>(),
+            expanded_node_vertices[(j + 1) % expanded_node_vertices.size()]
+            .get<1>()),
+          point(
+            expanded_node_vertices[j % expanded_node_vertices.size()]
+            .get<0>(),
+            expanded_node_vertices[j % expanded_node_vertices.size()]
+            .get<1>())});
     }
 
     size_t i = 0;
@@ -944,22 +1007,26 @@ void polyconvexdecomposition(std::vector<std::vector<double>> xy,
       std::vector<std::vector<point>> polygon2_edges;
       for (size_t j = 0; j < polygon_list[i].size(); j++) {
         polygon2_edges.push_back(
-            {point(polygon_list[i][j % polygon_list[i].size()][0],
-                   polygon_list[i][j % polygon_list[i].size()][1]),
-             point(polygon_list[i][(j + 1) % polygon_list[i].size()][0],
-                   polygon_list[i][(j + 1) % polygon_list[i].size()][1])});
+          {point(
+              polygon_list[i][j % polygon_list[i].size()][0],
+              polygon_list[i][j % polygon_list[i].size()][1]),
+            point(
+              polygon_list[i][(j + 1) % polygon_list[i].size()][0],
+              polygon_list[i][(j + 1) % polygon_list[i].size()][1])});
       }
       bool polygons_touch = false;
       size_t adj_edge_index = -1;
       for (size_t polygon1_edge_index = 0;
-           polygon1_edge_index < polygon1_edges.size(); polygon1_edge_index++) {
+        polygon1_edge_index < polygon1_edges.size(); polygon1_edge_index++)
+      {
         for (size_t polygon2_edge_index = 0;
-             polygon2_edge_index < polygon2_edges.size();
-             polygon2_edge_index++) {
+          polygon2_edge_index < polygon2_edges.size();
+          polygon2_edge_index++)
+        {
           line line1 =
-              BoostPointToBoostLine(polygon1_edges[polygon1_edge_index]);
+            BoostPointToBoostLine(polygon1_edges[polygon1_edge_index]);
           line line2 =
-              BoostPointToBoostLine(polygon2_edges[polygon2_edge_index]);
+            BoostPointToBoostLine(polygon2_edges[polygon2_edge_index]);
           if (bg::equals(line1, line2)) {
             polygons_touch = true;
             adj_edge_index = polygon2_edge_index;
@@ -986,10 +1053,11 @@ void polyconvexdecomposition(std::vector<std::vector<double>> xy,
         // Find the vertices of the added polygon
         std::vector<point> new_polygon_vertices;
         for (size_t j = 0; j < polygon_list[i].size(); j++) {
-          new_polygon_vertices.push_back(point(
+          new_polygon_vertices.push_back(
+            point(
               polygon_list[i][(adj_edge_index + j) % polygon_list[i].size()][0],
               polygon_list[i][(adj_edge_index + j) % polygon_list[i].size()]
-                          [1]));
+              [1]));
         }
         new_polygon.set_vertices(new_polygon_vertices);
 
@@ -1004,9 +1072,11 @@ void polyconvexdecomposition(std::vector<std::vector<double>> xy,
   }
 
   // Create comparator for depth
-  struct depth_comparator {
-    bool operator()(const PolygonClass a, const PolygonClass b) {
-      return (a.get_depth() > b.get_depth());
+  struct depth_comparator
+  {
+    bool operator()(const PolygonClass a, const PolygonClass b)
+    {
+      return a.get_depth() > b.get_depth();
     }
   };
 
@@ -1025,12 +1095,11 @@ void polyconvexdecomposition(std::vector<std::vector<double>> xy,
   // Update indices and predecessors appropriately
   for (size_t i = 0; i < tree->size() - 1; i++) {
     std::vector<size_t>::iterator it = std::find(
-        indices_old.begin(), indices_old.end(), (*tree)[i].get_predecessor());
+      indices_old.begin(), indices_old.end(), (*tree)[i].get_predecessor());
     (*tree)[i].set_predecessor(
-        indices_new[std::distance(indices_old.begin(), it)]);
+      indices_new[std::distance(indices_old.begin(), it)]);
     (*tree)[i].set_index(i);
   }
   (*tree)[tree->size() - 1].set_index(tree->size() - 1);
 
-  return;
 }

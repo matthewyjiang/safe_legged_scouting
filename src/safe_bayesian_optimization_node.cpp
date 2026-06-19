@@ -33,6 +33,7 @@
 #include <opencv2/opencv.hpp>
 #include <queue>
 #include <string>
+#include <stdexcept>
 #include <unordered_map>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -45,19 +46,24 @@
 
 namespace bg = boost::geometry;
 
-class OptimizerNode : public rclcpp::Node {
+class OptimizerNode : public rclcpp::Node
+{
 public:
-  OptimizerNode() : Node("optimizer_node") {
+  OptimizerNode()
+  : Node("optimizer_node")
+  {
     // Declare parameters
     this->declare_parameter("opt.beta", 2.0);
     this->declare_parameter("opt.f_max", 0.0);
     this->declare_parameter("opt.lipschitz", 1.0);
-    this->declare_parameter("terrain_map.resolution",
-                            std::vector<double>{0.1, 0.1});
+    this->declare_parameter(
+      "terrain_map.resolution",
+      std::vector<double>{0.1, 0.1});
     this->declare_parameter("debug.publish_debug_image", false);
     this->declare_parameter("opt.subgoal_erosion", 0.2);
-    this->declare_parameter("opt.preference_order",
-                            std::vector<std::string>{"g", "l", "e"});
+    this->declare_parameter(
+      "opt.preference_order",
+      std::vector<std::string>{"g", "l", "e"});
     this->declare_parameter("opt.update_on_measurement", false);
     this->declare_parameter("opt.expansion_score_k", 1.0);
     this->declare_parameter("opt.goal_score_k", 1.0);
@@ -70,106 +76,122 @@ public:
     f_max_ = this->get_parameter("opt.f_max").as_double();
     lipschitz_L_ = this->get_parameter("opt.lipschitz").as_double();
     auto resolution_vector =
-        this->get_parameter("terrain_map.resolution").as_double_array();
+      this->get_parameter("terrain_map.resolution").as_double_array();
     if (resolution_vector.size() != 2) {
-      RCLCPP_ERROR(this->get_logger(),
-                   "terrain_map.resolution must be an array of 2 values "
-                   "[x_resolution, y_resolution]");
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "terrain_map.resolution must be an array of 2 values "
+        "[x_resolution, y_resolution]");
       throw std::runtime_error("Invalid terrain_map.resolution parameter");
     }
     terrain_x_resolution_ = resolution_vector[0];
     terrain_y_resolution_ = resolution_vector[1];
     publish_debug_image_ =
-        this->get_parameter("debug.publish_debug_image").as_bool();
+      this->get_parameter("debug.publish_debug_image").as_bool();
     subgoal_erosion_ = this->get_parameter("opt.subgoal_erosion").as_double();
     auto preference_order_param =
-        this->get_parameter("opt.preference_order").as_string_array();
+      this->get_parameter("opt.preference_order").as_string_array();
     update_on_measurement_ = this->get_parameter("opt.update_on_measurement").as_bool();
     expansion_score_k_ = this->get_parameter("opt.expansion_score_k").as_double();
     goal_score_k_ = this->get_parameter("opt.goal_score_k").as_double();
     selection_strategy_ = this->get_parameter("opt.selection_strategy").as_string();
-    if (selection_strategy_ != "max" && selection_strategy_ != "alternating_preference" && selection_strategy_ != "goal_only") {
-      RCLCPP_WARN(this->get_logger(),
-                  "Unknown opt.selection_strategy '%s'; defaulting to 'max'",
-                  selection_strategy_.c_str());
+    if (selection_strategy_ != "max" && selection_strategy_ != "alternating_preference" &&
+      selection_strategy_ != "goal_only")
+    {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "Unknown opt.selection_strategy '%s'; defaulting to 'max'",
+        selection_strategy_.c_str());
       selection_strategy_ = "max";
     }
     robot_radius_ = this->get_parameter("robot.radius").as_double();
     simplification_tolerance_ = this->get_parameter("polygon.simplification_tolerance").as_double();
 
+    preference_order_ = ParsePreferenceOrder(preference_order_param);
+    preference_index_ = 0;
+    has_terrain_map_ = false;
+    has_robot_pose_ = false;
+    last_subgoal_valid_ = false;
+    new_subgoal_requested_ = true;
+    robot_pose_topic = "spirit/current_pose";
+
     // Create service clients
     terrain_map_client_ = this->create_client<
-        trusses_custom_interfaces::srv::GetTerrainMapWithUncertainty>(
-        "get_terrain_map_with_uncertainty");
+      trusses_custom_interfaces::srv::GetTerrainMapWithUncertainty>(
+      "get_terrain_map_with_uncertainty");
 
     // Create subscribers
     goal_point_sub_ =
-        this->create_subscription<geometry_msgs::msg::PointStamped>(
-            "goal_point", 10,
-            std::bind(&OptimizerNode::goal_point_callback, this,
-                      std::placeholders::_1));
+      this->create_subscription<geometry_msgs::msg::PointStamped>(
+      "goal_point", 10,
+      std::bind(
+        &OptimizerNode::goal_point_callback, this,
+        std::placeholders::_1));
 
     robot_pose_sub_ = this->create_subscription<geometry_msgs::msg::Pose>(
-        robot_pose_topic, 10,
-        std::bind(&OptimizerNode::robot_pose_callback, this,
-                  std::placeholders::_1));
-    
+      robot_pose_topic, 10,
+      std::bind(
+        &OptimizerNode::robot_pose_callback, this,
+        std::placeholders::_1));
+
     spatial_data_size_sub_ =
-        this->create_subscription<std_msgs::msg::Int32>(
-            "spatial_data_size", 10,
-            std::bind(&OptimizerNode::spatial_data_size_callback, this,
-                      std::placeholders::_1));
+      this->create_subscription<std_msgs::msg::Int32>(
+      "spatial_data_size", 10,
+      std::bind(
+        &OptimizerNode::spatial_data_size_callback, this,
+        std::placeholders::_1));
     subgoal_reached_sub_ =
-        this->create_subscription<std_msgs::msg::Empty>(
-            "/subgoal_reached", 10,
-            std::bind(&OptimizerNode::subgoal_reached_callback, this,
-                      std::placeholders::_1));
+      this->create_subscription<std_msgs::msg::Empty>(
+      "/subgoal_reached", 10,
+      std::bind(
+        &OptimizerNode::subgoal_reached_callback, this,
+        std::placeholders::_1));
 
     // Create publishers
     current_subgoal_pub_ = this->create_publisher<geometry_msgs::msg::Point>(
-        "current_subgoal", 10);
+      "current_subgoal", 10);
 
     subgoal_marker_pub_ =
-        this->create_publisher<visualization_msgs::msg::Marker>(
-            "subgoal_marker", 10);
+      this->create_publisher<visualization_msgs::msg::Marker>(
+      "subgoal_marker", 10);
     polygons_pub_ =
-        this->create_publisher<safe_bayesian_optimization::msg::PolygonArray>(
-            "polygon_array", 10);
+      this->create_publisher<safe_bayesian_optimization::msg::PolygonArray>(
+      "polygon_array", 10);
 
     envelope_pub_ = this->create_publisher<geometry_msgs::msg::Polygon>(
-        "envelope_polygon", 10);
+      "envelope_polygon", 10);
 
     // Create concave polygon markers publisher
     concave_markers_pub_ =
-        this->create_publisher<visualization_msgs::msg::MarkerArray>(
-            "/concave_markers", 10);
+      this->create_publisher<visualization_msgs::msg::MarkerArray>(
+      "/concave_markers", 10);
 
     // Create projected goal marker publisher
     projected_goal_marker_pub_ =
-        this->create_publisher<visualization_msgs::msg::Marker>(
-            "/projected_goal_marker", 10);
+      this->create_publisher<visualization_msgs::msg::Marker>(
+      "/projected_goal_marker", 10);
 
     // Create frontier visualization marker array publishers
     frontier_goal_score_markers_pub_ =
-        this->create_publisher<visualization_msgs::msg::MarkerArray>(
-            "/frontier_goal_score_markers", 10);
+      this->create_publisher<visualization_msgs::msg::MarkerArray>(
+      "/frontier_goal_score_markers", 10);
     frontier_expansion_prob_markers_pub_ =
-        this->create_publisher<visualization_msgs::msg::MarkerArray>(
-            "/frontier_expansion_prob_markers", 10);
+      this->create_publisher<visualization_msgs::msg::MarkerArray>(
+      "/frontier_expansion_prob_markers", 10);
     frontier_overall_score_markers_pub_ =
-        this->create_publisher<visualization_msgs::msg::MarkerArray>(
-            "/frontier_overall_score_markers", 10);
+      this->create_publisher<visualization_msgs::msg::MarkerArray>(
+      "/frontier_overall_score_markers", 10);
     frontier_goal_distance_markers_pub_ =
-        this->create_publisher<visualization_msgs::msg::MarkerArray>(
-            "/frontier_goal_distance_markers", 10);
+      this->create_publisher<visualization_msgs::msg::MarkerArray>(
+      "/frontier_goal_distance_markers", 10);
     frontier_robot_distance_markers_pub_ =
-        this->create_publisher<visualization_msgs::msg::MarkerArray>(
-            "/frontier_robot_distance_markers", 10);
+      this->create_publisher<visualization_msgs::msg::MarkerArray>(
+      "/frontier_robot_distance_markers", 10);
 
     // Only create debug image publisher if enabled
     if (publish_debug_image_) {
       debug_image_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-          "debug_polygons_image", 10);
+        "debug_polygons_image", 10);
     }
 
     // Initialize last spatial data size
@@ -206,34 +228,34 @@ private:
 
   // Spatial data monitoring
   rclcpp::Client<trusses_custom_interfaces::srv::GetTerrainMapWithUncertainty>::
-      SharedPtr terrain_map_client_;
+  SharedPtr terrain_map_client_;
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr
-      goal_point_sub_;
+    goal_point_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Pose>::SharedPtr robot_pose_sub_;
   rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr
-      spatial_data_size_sub_;
+    spatial_data_size_sub_;
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr subgoal_reached_sub_;
   int last_spatial_data_size_;
   rclcpp::Publisher<geometry_msgs::msg::Point>::SharedPtr current_subgoal_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr
-      subgoal_marker_pub_;
+    subgoal_marker_pub_;
   rclcpp::Publisher<safe_bayesian_optimization::msg::PolygonArray>::SharedPtr
-      polygons_pub_;
+    polygons_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Polygon>::SharedPtr envelope_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
-      concave_markers_pub_;
+    concave_markers_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr
-      projected_goal_marker_pub_;
+    projected_goal_marker_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
-      frontier_goal_score_markers_pub_;
+    frontier_goal_score_markers_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
-      frontier_expansion_prob_markers_pub_;
+    frontier_expansion_prob_markers_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
-      frontier_overall_score_markers_pub_;
+    frontier_overall_score_markers_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
-      frontier_goal_distance_markers_pub_;
+    frontier_goal_distance_markers_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
-      frontier_robot_distance_markers_pub_;
+    frontier_robot_distance_markers_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr debug_image_pub_;
 
   // Parameters from config
@@ -258,30 +280,56 @@ private:
   bool confidence_initialized_;
   bool safe_set_initialized_;
 
+  enum class PreferenceMetric
+  {
+    Goal,
+    Last,
+    Expansion,
+  };
+
+  struct CandidateScore
+  {
+    double goal_score;
+    double robot_score;
+    double expansion_score;
+    double prob_expansion;
+    int frontier_idx;
+    int data_index;
+  };
+
   // Disjoint set data structure using map
-  class DisjointSet {
-  private:
+  class DisjointSet
+  {
+private:
     std::map<int, int> parent_;
     std::map<int, int> rank_;
 
-  public:
-    void make_set(int x) {
+public:
+    void make_set(int x)
+    {
       if (parent_.find(x) == parent_.end()) {
         parent_[x] = x;
         rank_[x] = 0;
       }
     }
+  };
 
-  void ComputeSets() {
-    UpdateMonotonicConfidenceIntervals();
-    UpdateSafeSetWithLipschitz();
-  }
+  std::vector<PreferenceMetric> preference_order_;
+  size_t preference_index_;
+  bool has_terrain_map_;
+  bool has_robot_pose_;
+  geometry_msgs::msg::Point current_robot_position_;
+  geometry_msgs::msg::Point last_subgoal_;
+  bool last_subgoal_valid_;
+  bool new_subgoal_requested_;
+  std::string robot_pose_topic;
 
   std::vector<PreferenceMetric> ParsePreferenceOrder(
-      const std::vector<std::string> &order) {
+    const std::vector<std::string> & order)
+  {
     std::vector<PreferenceMetric> metrics;
     metrics.reserve(order.size());
-    for (const auto &token : order) {
+    for (const auto & token : order) {
       if (token == "g" || token == "goal") {
         metrics.push_back(PreferenceMetric::Goal);
       } else if (token == "l" || token == "last") {
@@ -289,74 +337,24 @@ private:
       } else if (token == "e" || token == "expansion") {
         metrics.push_back(PreferenceMetric::Expansion);
       } else {
-        RCLCPP_WARN(this->get_logger(),
-                    "Unknown preference token '%s' in opt.preference_order",
-                    token.c_str());
+        RCLCPP_WARN(
+          this->get_logger(),
+          "Unknown preference token '%s' in opt.preference_order",
+          token.c_str());
       }
     }
     return metrics;
   }
 
 
-  void InitializeConfidenceBoundsIfNeeded() {
-    if (C_low_.size() == mu_.size()) {
-      return;
-    }
-
-    const double neg_inf = -std::numeric_limits<double>::infinity();
-    const double pos_inf = std::numeric_limits<double>::infinity();
-
-    C_low_.resize(mu_.size());
-    C_high_.resize(mu_.size());
-    C_low_.setConstant(neg_inf);
-    C_high_.setConstant(pos_inf);
-
-    S_.resize(mu_.size());
-    S_.setConstant(false);
-
-    confidence_initialized_ = true;
-    safe_set_initialized_ = false;
-  }
-
-  void UpdateMonotonicConfidenceIntervals() {
-    InitializeConfidenceBoundsIfNeeded();
-
-    const double sqrt_beta = std::sqrt(beta_);
-    const Eigen::VectorXd confidence = sqrt_beta * std_;
-
-    const Eigen::VectorXd Q_low = mu_ - confidence;
-    const Eigen::VectorXd Q_high = mu_ + confidence;
-
-    Q_.col(0) = Q_low;
-    Q_.col(1) = Q_high;
-
-    C_low_ = C_low_.cwiseMax(Q_low);
-    C_high_ = C_high_.cwiseMin(Q_high);
-  }
-
-  void UpdateSafeSetWithLipschitz() {
-    if (S_.rows() == 0 || D_.rows() == 0) {
-      return;
-    }
-
-    if (lipschitz_L_ <= 0.0) {
-      RCLCPP_WARN(this->get_logger(),
-                  "Lipschitz constant <= 0; safe set will not expand.");
-      return;
-    }
-
-    const int n_points = D_.rows();
-    std::vector<char> safe_flags(n_points, 0);
-
-    std::vector<int> anchor_indices;
-    anchor_indices.reserve(n_points);
-
-  void ComputeSets() {
+  void ComputeSets()
+  {
     UpdateMonotonicConfidenceIntervals();
     UpdateSafeSetWithLipschitz();
   }
 
-  void InitializeConfidenceBoundsIfNeeded() {
+  void InitializeConfidenceBoundsIfNeeded()
+  {
     if (C_low_.size() == mu_.size()) {
       return;
     }
@@ -376,7 +374,8 @@ private:
     safe_set_initialized_ = false;
   }
 
-  void UpdateMonotonicConfidenceIntervals() {
+  void UpdateMonotonicConfidenceIntervals()
+  {
     InitializeConfidenceBoundsIfNeeded();
 
     const double sqrt_beta = std::sqrt(beta_);
@@ -392,14 +391,16 @@ private:
     C_high_ = C_high_.cwiseMin(Q_high);
   }
 
-  void UpdateSafeSetWithLipschitz() {
+  void UpdateSafeSetWithLipschitz()
+  {
     if (S_.rows() == 0 || D_.rows() == 0) {
       return;
     }
 
     if (lipschitz_L_ <= 0.0) {
-      RCLCPP_WARN(this->get_logger(),
-                  "Lipschitz constant <= 0; safe set will not expand.");
+      RCLCPP_WARN(
+        this->get_logger(),
+        "Lipschitz constant <= 0; safe set will not expand.");
       return;
     }
 
@@ -419,7 +420,7 @@ private:
     const int width = terrain_width_cells_;
     const int height = terrain_height_cells_;
     const bool has_grid = (width > 0 && height > 0 &&
-                           static_cast<int>(width * height) == n_points);
+      static_cast<int>(width * height) == n_points);
 
     if (has_grid) {
       const double min_x = D_.col(0).minCoeff();
@@ -427,11 +428,11 @@ private:
       const double min_y = D_.col(1).minCoeff();
       const double max_y = D_.col(1).maxCoeff();
       const double cell_width =
-          (width > 1) ? (max_x - min_x) / (width - 1) : terrain_x_resolution_;
+        (width > 1) ? (max_x - min_x) / (width - 1) : terrain_x_resolution_;
       const double cell_height =
-          (height > 1) ? (max_y - min_y) / (height - 1) : terrain_y_resolution_;
+        (height > 1) ? (max_y - min_y) / (height - 1) : terrain_y_resolution_;
       const double max_grid_dist =
-          std::hypot((width - 1) * cell_width, (height - 1) * cell_height);
+        std::hypot((width - 1) * cell_width, (height - 1) * cell_height);
 
       for (int anchor : anchor_indices) {
         const double u_anchor = C_high_(anchor);
@@ -452,9 +453,9 @@ private:
         const int anchor_i = anchor / height;
         const int anchor_j = anchor % height;
         const int max_i_offset =
-            static_cast<int>(std::floor(radius / cell_width));
+          static_cast<int>(std::floor(radius / cell_width));
         const int max_j_offset =
-            static_cast<int>(std::floor(radius / cell_height));
+          static_cast<int>(std::floor(radius / cell_height));
 
         const int i_min = std::max(0, anchor_i - max_i_offset);
         const int i_max = std::min(width - 1, anchor_i + max_i_offset);
@@ -505,7 +506,8 @@ private:
     }
   }
 
-  std::vector<int> FindSafetyContourIndices() {
+  std::vector<int> FindSafetyContourIndices()
+  {
     if (D_.rows() == 0 || S_.rows() == 0) {
       RCLCPP_WARN(this->get_logger(), "D_ or S_ is empty");
       return {};
@@ -527,8 +529,9 @@ private:
     int width = terrain_width_cells_;
     int height = terrain_height_cells_;
 
-    RCLCPP_INFO(this->get_logger(), "Using grid dimensions: %dx%d", width,
-                height);
+    RCLCPP_INFO(
+      this->get_logger(), "Using grid dimensions: %dx%d", width,
+      height);
 
     // Create binary image from safety data
     cv::Mat safety_image = cv::Mat::zeros(height, width, CV_8UC1);
@@ -548,8 +551,9 @@ private:
     // Find contours with hierarchy to properly handle holes
     std::vector<std::vector<cv::Point>> contours;
     std::vector<cv::Vec4i> hierarchy;
-    cv::findContours(safety_image, contours, hierarchy, cv::RETR_CCOMP,
-                     cv::CHAIN_APPROX_SIMPLE);
+    cv::findContours(
+      safety_image, contours, hierarchy, cv::RETR_CCOMP,
+      cv::CHAIN_APPROX_SIMPLE);
 
     RCLCPP_INFO(this->get_logger(), "Found %lu contours", contours.size());
 
@@ -565,11 +569,12 @@ private:
     }
 
     std::vector<int> contour_indices;
-    contour_indices.reserve(contours.size() *
-                            50); // Reserve reasonable capacity
+    contour_indices.reserve(
+      contours.size() *
+      50);                       // Reserve reasonable capacity
 
-    for (const auto &contour : contours) {
-      for (const auto &point : contour) {
+    for (const auto & contour : contours) {
+      for (const auto & point : contour) {
         // O(1) lookup using scaled coordinates
         auto x_it = coord_to_index.find(point.x);
         if (x_it != coord_to_index.end()) {
@@ -581,12 +586,14 @@ private:
       }
     }
 
-    RCLCPP_INFO(this->get_logger(), "Found %lu contour points",
-                contour_indices.size());
+    RCLCPP_INFO(
+      this->get_logger(), "Found %lu contour points",
+      contour_indices.size());
     return contour_indices;
   }
 
-  int GetNextSubgoal() {
+  int GetNextSubgoal()
+  {
     const auto start = std::chrono::steady_clock::now();
     // Get frontier indices
     const std::vector<int> frontier_indices = FindSafetyContourIndices();
@@ -597,8 +604,9 @@ private:
     }
 
     if (!has_robot_pose_) {
-      RCLCPP_WARN(this->get_logger(),
-                  "No robot pose available; cannot select subgoal");
+      RCLCPP_WARN(
+        this->get_logger(),
+        "No robot pose available; cannot select subgoal");
       return -1;
     }
 
@@ -611,21 +619,22 @@ private:
     int height = terrain_height_cells_;
 
     if (width <= 0 || height <= 0 || max_x == min_x || max_y == min_y) {
-      RCLCPP_WARN(this->get_logger(),
-                  "Invalid grid bounds for safe region lookup");
+      RCLCPP_WARN(
+        this->get_logger(),
+        "Invalid grid bounds for safe region lookup");
       return -1;
     }
 
-    auto map_to_grid = [=](double x, double y, int &gx, int &gy) {
-      const double nx = (x - min_x) / (max_x - min_x);
-      const double ny = (y - min_y) / (max_y - min_y);
-      const int max_gx = std::max(width - 1, 0);
-      const int max_gy = std::max(height - 1, 0);
-      gx = static_cast<int>(std::lround(nx * max_gx));
-      gy = static_cast<int>(std::lround(ny * max_gy));
-      gx = std::clamp(gx, 0, max_gx);
-      gy = std::clamp(gy, 0, max_gy);
-    };
+    auto map_to_grid = [ = ](double x, double y, int & gx, int & gy) {
+        const double nx = (x - min_x) / (max_x - min_x);
+        const double ny = (y - min_y) / (max_y - min_y);
+        const int max_gx = std::max(width - 1, 0);
+        const int max_gy = std::max(height - 1, 0);
+        gx = static_cast<int>(std::lround(nx * max_gx));
+        gy = static_cast<int>(std::lround(ny * max_gy));
+        gx = std::max(0, std::min(gx, max_gx));
+        gy = std::max(0, std::min(gy, max_gy));
+      };
 
     const auto safety_image_start = std::chrono::steady_clock::now();
     cv::Mat safety_image = cv::Mat::zeros(height, width, CV_8UC1);
@@ -646,12 +655,15 @@ private:
 
     int robot_gx = 0;
     int robot_gy = 0;
-    map_to_grid(current_robot_position_.x, current_robot_position_.y, robot_gx,
-                robot_gy);
+    map_to_grid(
+      current_robot_position_.x, current_robot_position_.y, robot_gx,
+      robot_gy);
     if (robot_gx < 0 || robot_gx >= width || robot_gy < 0 ||
-        robot_gy >= height) {
-      RCLCPP_WARN(this->get_logger(),
-                  "Robot position is outside grid bounds");
+      robot_gy >= height)
+    {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "Robot position is outside grid bounds");
       return -1;
     }
 
@@ -675,15 +687,17 @@ private:
       if (nearest_safe_idx >= 0) {
         int safe_gx = 0;
         int safe_gy = 0;
-        map_to_grid(D_(nearest_safe_idx, 0), D_(nearest_safe_idx, 1), safe_gx,
-                    safe_gy);
+        map_to_grid(
+          D_(nearest_safe_idx, 0), D_(nearest_safe_idx, 1), safe_gx,
+          safe_gy);
         robot_label = labels.at<int>(safe_gy, safe_gx);
       }
     }
 
     if (robot_label == 0) {
-      RCLCPP_WARN(this->get_logger(),
-                  "Robot is not within any safe region");
+      RCLCPP_WARN(
+        this->get_logger(),
+        "Robot is not within any safe region");
       return -1;
     }
 
@@ -695,15 +709,17 @@ private:
       int gy = 0;
       map_to_grid(D_(idx, 0), D_(idx, 1), gx, gy);
       if (gx >= 0 && gx < width && gy >= 0 && gy < height &&
-          labels.at<int>(gy, gx) == robot_label) {
+        labels.at<int>(gy, gx) == robot_label)
+      {
         candidate_indices.push_back(idx);
       }
     }
     const auto candidate_end = std::chrono::steady_clock::now();
 
     if (candidate_indices.empty()) {
-      RCLCPP_WARN(this->get_logger(),
-                  "No frontier points found in robot's safe region");
+      RCLCPP_WARN(
+        this->get_logger(),
+        "No frontier points found in robot's safe region");
       return -1;
     }
 
@@ -734,39 +750,43 @@ private:
       }
 
       if (best_index < 0) {
-        RCLCPP_WARN(this->get_logger(),
-                    "Failed to select frontier point by uncertainty");
+        RCLCPP_WARN(
+          this->get_logger(),
+          "Failed to select frontier point by uncertainty");
         return -1;
       }
 
-      return frontier_indices[best_index];
+      return candidate_indices[best_index];
     }
 
     const Eigen::VectorXd goal_eigen =
-        (Eigen::VectorXd(2) << current_goal_.point.x, current_goal_.point.y)
-            .finished();
+      (Eigen::VectorXd(2) << current_goal_.point.x, current_goal_.point.y)
+      .finished();
+    const Eigen::VectorXd robot_position_eigen =
+      (Eigen::VectorXd(2) << current_robot_position_.x, current_robot_position_.y)
+      .finished();
     const Eigen::VectorXd robot_to_candidate_distances =
-        (frontier_points.rowwise() - robot_position_eigen.transpose())
-            .rowwise()
-            .norm();
+      (frontier_points.rowwise() - robot_position_eigen.transpose())
+      .rowwise()
+      .norm();
     const Eigen::VectorXd robot_scores =
-        (-goal_score_k_ * robot_to_candidate_distances.array()).exp().matrix();
+      (-goal_score_k_ * robot_to_candidate_distances.array()).exp().matrix();
 
     const auto goal_scores_start = std::chrono::steady_clock::now();
     Eigen::VectorXd goal_scores(num_frontiers);
     Eigen::VectorXd goal_distances = Eigen::VectorXd::Zero(num_frontiers);
     if (goal_received_) {
       const Eigen::VectorXd goal_eigen =
-          (Eigen::VectorXd(2) << current_goal_.point.x, current_goal_.point.y)
-              .finished();
+        (Eigen::VectorXd(2) << current_goal_.point.x, current_goal_.point.y)
+        .finished();
       goal_distances =
-          (frontier_points.rowwise() - goal_eigen.transpose()).rowwise().norm();
+        (frontier_points.rowwise() - goal_eigen.transpose()).rowwise().norm();
       // goal_score = exp(-goal_score_k * (goal_distance + robot_distance))
       goal_scores =
-          (-goal_score_k_ *
-           (goal_distances.array() + robot_to_candidate_distances.array()))
-              .exp()
-              .matrix();
+        (-goal_score_k_ *
+        (goal_distances.array() + robot_to_candidate_distances.array()))
+        .exp()
+        .matrix();
     } else {
       // If no goal, use robot_distance only.
       goal_scores = robot_scores;
@@ -774,7 +794,7 @@ private:
 
     const auto expansion_start = std::chrono::steady_clock::now();
     Eigen::VectorXi expansion_scores =
-        Eigen::VectorXi::Zero(static_cast<int>(num_frontiers));
+      Eigen::VectorXi::Zero(static_cast<int>(num_frontiers));
     if (lipschitz_L_ > 0.0) {
       std::vector<std::vector<int>> unsafe_bins;
       unsafe_bins.resize(static_cast<size_t>(width * height));
@@ -794,11 +814,11 @@ private:
 
       if (unsafe_count > 0) {
         const double cell_size_x =
-            (max_x - min_x) / std::max(width - 1, 1);
+          (max_x - min_x) / std::max(width - 1, 1);
         const double cell_size_y =
-            (max_y - min_y) / std::max(height - 1, 1);
+          (max_y - min_y) / std::max(height - 1, 1);
         const double min_cell_size =
-            std::max(std::min(cell_size_x, cell_size_y), 1e-9);
+          std::max(std::min(cell_size_x, cell_size_y), 1e-9);
 
         for (size_t i = 0; i < num_frontiers; ++i) {
           const int idx = candidate_indices[i];
@@ -811,10 +831,11 @@ private:
           const double radius_sq = radius * radius;
           int center_gx = 0;
           int center_gy = 0;
-          map_to_grid(frontier_points(i, 0), frontier_points(i, 1), center_gx,
-                      center_gy);
+          map_to_grid(
+            frontier_points(i, 0), frontier_points(i, 1), center_gx,
+            center_gy);
           const int r_cells =
-              static_cast<int>(std::ceil(radius / min_cell_size));
+            static_cast<int>(std::ceil(radius / min_cell_size));
           const int gx_min = std::max(center_gx - r_cells, 0);
           const int gx_max = std::min(center_gx + r_cells, width - 1);
           const int gy_min = std::max(center_gy - r_cells, 0);
@@ -823,8 +844,8 @@ private:
           int expansion_score = 0;
           for (int gy = gy_min; gy <= gy_max; ++gy) {
             for (int gx = gx_min; gx <= gx_max; ++gx) {
-              const auto &bin =
-                  unsafe_bins[static_cast<size_t>(gy * width + gx)];
+              const auto & bin =
+                unsafe_bins[static_cast<size_t>(gy * width + gx)];
               if (bin.empty()) {
                 continue;
               }
@@ -848,11 +869,11 @@ private:
     // When expansion_score = 0: prob_expansion = 0
     // Higher k = faster approach to 1.0
     auto compute_prob_expansion = [this](double expansion_score) -> double {
-      if (expansion_score <= 0.0) {
-        return 0.0;
-      }
-      return 1.0 - std::exp(-expansion_score_k_ * expansion_score);
-    };
+        if (expansion_score <= 0.0) {
+          return 0.0;
+        }
+        return 1.0 - std::exp(-expansion_score_k_ * expansion_score);
+      };
 
     const auto pareto_start = std::chrono::steady_clock::now();
     std::vector<CandidateScore> candidates;
@@ -861,48 +882,85 @@ private:
       double exp_score = static_cast<double>(expansion_scores(static_cast<int>(i)));
       double prob_exp = compute_prob_expansion(exp_score);
       CandidateScore candidate{
-          goal_scores(static_cast<int>(i)),
-          robot_scores(static_cast<int>(i)),
-          exp_score,
-          prob_exp,
-          static_cast<int>(i),
-          candidate_indices[i]};
+        goal_scores(static_cast<int>(i)),
+        robot_scores(static_cast<int>(i)),
+        exp_score,
+        prob_exp,
+        static_cast<int>(i),
+        candidate_indices[i]};
       candidates.push_back(candidate);
     }
 
-    // Take top 25% of closest points
-    size_t top_quarter_size = std::max(size_t(1), distance_pairs.size() / 4);
+    // Sort points by distance to goal for the confidence-width fallback.
+    std::vector<std::pair<double, size_t>> distance_pairs;
+    distance_pairs.reserve(num_frontiers);
+    for (size_t i = 0; i < num_frontiers; ++i) {
+      distance_pairs.emplace_back(goal_distances(i), i);
+    }
+    std::sort(distance_pairs.begin(), distance_pairs.end());
 
-    // Find the point with best confidence width among the closest points
+    std::map<double, CandidateScore> frontier_2d;
+    for (const auto & candidate : candidates) {
+      auto it = frontier_2d.lower_bound(candidate.robot_score);
+      if (it != frontier_2d.end() &&
+        it->second.prob_expansion >= candidate.prob_expansion)
+      {
+        continue;
+      }
+
+      while (it != frontier_2d.begin()) {
+        auto prev = std::prev(it);
+        if (prev->second.prob_expansion <= candidate.prob_expansion) {
+          frontier_2d.erase(prev);
+        } else {
+          break;
+        }
+      }
+
+      if (it != frontier_2d.end() && it->first == candidate.robot_score &&
+        it->second.prob_expansion <= candidate.prob_expansion)
+      {
+        frontier_2d.erase(it);
+      }
+
+      frontier_2d.emplace(candidate.robot_score, candidate);
+    }
+    const auto pareto_end = std::chrono::steady_clock::now();
+
+    // Take top 25% of closest points as a fallback if strategy selection fails.
+    size_t top_quarter_size = std::max(size_t(1), distance_pairs.size() / 4);
     double best_confidence_width = -1.0;
     int best_index = -1;
-
     for (size_t i = 0; i < top_quarter_size; ++i) {
       size_t frontier_idx = distance_pairs[i].second;
       double conf_width = frontier_confidence_width(frontier_idx);
-
       if (conf_width > best_confidence_width) {
         best_confidence_width = conf_width;
         best_index = static_cast<int>(frontier_idx);
       }
-      pareto_end = std::chrono::steady_clock::now();
+    }
 
-      // --- Strategy-specific selection from Pareto front ---
-      if (selection_strategy_ == "alternating_preference") {
-        PreferenceMetric preference = PreferenceMetric::Expansion;
-        const char *preference_name = "expansion";
-        if (goal_received_) {
-          if (preference_order_.empty()) {
-            RCLCPP_WARN(this->get_logger(),
-                        "Preference order is empty; using goal score.");
-            preference_order_ = {PreferenceMetric::Goal};
-            preference_index_ = 0;
-          }
+    const CandidateScore * best = nullptr;
+    double best_metric = -std::numeric_limits<double>::infinity();
+    auto preference_start = std::chrono::steady_clock::now();
+    auto preference_end = preference_start;
 
-          preference =
-              preference_order_[preference_index_ % preference_order_.size()];
-          preference_name = "unknown";
-          switch (preference) {
+    // --- Strategy-specific selection from Pareto front ---
+    if (selection_strategy_ == "alternating_preference") {
+      PreferenceMetric preference = PreferenceMetric::Expansion;
+      const char * preference_name = "expansion";
+      if (goal_received_) {
+        if (preference_order_.empty()) {
+          RCLCPP_WARN(
+            this->get_logger(),
+            "Preference order is empty; using goal score.");
+          preference_order_ = {PreferenceMetric::Goal};
+          preference_index_ = 0;
+        }
+
+        preference = preference_order_[preference_index_ % preference_order_.size()];
+        preference_name = "unknown";
+        switch (preference) {
           case PreferenceMetric::Goal:
             preference_name = "goal";
             break;
@@ -912,20 +970,19 @@ private:
           case PreferenceMetric::Expansion:
             preference_name = "expansion";
             break;
-          }
-          preference_index_ =
-              (preference_index_ + 1) % preference_order_.size();
         }
-        RCLCPP_INFO(this->get_logger(),
-                    "Selecting subgoal using strategy: alternating_preference, "
-                    "preference: %s",
-                    preference_name);
+        preference_index_ = (preference_index_ + 1) % preference_order_.size();
+      }
+      RCLCPP_INFO(
+        this->get_logger(),
+        "Selecting subgoal using strategy: alternating_preference, preference: %s",
+        preference_name);
 
-        preference_start = std::chrono::steady_clock::now();
-        for (const auto &entry : frontier_2d) {
-          const CandidateScore &candidate = entry.second;
-          double metric_value = 0.0;
-          switch (preference) {
+      preference_start = std::chrono::steady_clock::now();
+      for (const auto & entry : frontier_2d) {
+        const CandidateScore & candidate = entry.second;
+        double metric_value = 0.0;
+        switch (preference) {
           case PreferenceMetric::Goal:
             metric_value = candidate.goal_score;
             break;
@@ -935,122 +992,125 @@ private:
           case PreferenceMetric::Expansion:
             metric_value = candidate.prob_expansion;
             break;
-          }
+        }
 
-          if (!best || metric_value > best_metric) {
-            best = &candidate;
-            best_metric = metric_value;
-          }
+        if (!best || metric_value > best_metric) {
+          best = &candidate;
+          best_metric = metric_value;
         }
-        preference_end = std::chrono::steady_clock::now();
-      } else {
-        // "max" strategy: pick Pareto-optimal candidate with highest
-        // overall_score = goal_score * prob_expansion
-        preference_start = std::chrono::steady_clock::now();
-        for (const auto &entry : frontier_2d) {
-          const CandidateScore &candidate = entry.second;
-          const double overall_score =
-              candidate.goal_score * candidate.prob_expansion;
-          if (!best || overall_score > best_metric) {
-            best = &candidate;
-            best_metric = overall_score;
-          }
-        }
-        preference_end = std::chrono::steady_clock::now();
-        RCLCPP_INFO(this->get_logger(),
-                    "Selecting subgoal using strategy: max (overall_score = "
-                    "goal_score * prob_expansion, from %zu Pareto-optimal "
-                    "candidates)",
-                    frontier_2d.size());
       }
+      preference_end = std::chrono::steady_clock::now();
+    } else {
+      // "max" strategy: pick Pareto-optimal candidate with highest
+      // overall_score = goal_score * prob_expansion
+      preference_start = std::chrono::steady_clock::now();
+      for (const auto & entry : frontier_2d) {
+        const CandidateScore & candidate = entry.second;
+        const double overall_score = candidate.goal_score * candidate.prob_expansion;
+        if (!best || overall_score > best_metric) {
+          best = &candidate;
+          best_metric = overall_score;
+        }
+      }
+      preference_end = std::chrono::steady_clock::now();
+      RCLCPP_INFO(
+        this->get_logger(),
+        "Selecting subgoal using strategy: max (overall_score = goal_score * prob_expansion, from %zu Pareto-optimal candidates)",
+        frontier_2d.size());
     }
 
     if (!best) {
-      RCLCPP_INFO(this->get_logger(),
-                  "Timing(GetNextSubgoal): safety_image=%ld ms, "
-                  "connected=%ld ms, candidates=%ld ms, extract=%ld ms, "
-                  "goal_scores=%ld ms, expansion=%ld ms, pareto=%ld ms, "
-                  "preference=%ld ms, total=%ld ms",
-                  std::chrono::duration_cast<std::chrono::milliseconds>(
-                      safety_image_end - safety_image_start)
-                      .count(),
-                  std::chrono::duration_cast<std::chrono::milliseconds>(
-                      connected_end - connected_start)
-                      .count(),
-                  std::chrono::duration_cast<std::chrono::milliseconds>(
-                      candidate_end - candidate_start)
-                      .count(),
-                  std::chrono::duration_cast<std::chrono::milliseconds>(
-                      frontier_extract_end - frontier_extract_start)
-                      .count(),
-                  std::chrono::duration_cast<std::chrono::milliseconds>(
-                      expansion_start - goal_scores_start)
-                      .count(),
-                  std::chrono::duration_cast<std::chrono::milliseconds>(
-                      expansion_end - expansion_start)
-                      .count(),
-                  std::chrono::duration_cast<std::chrono::milliseconds>(
-                      pareto_end - pareto_start)
-                      .count(),
-                  std::chrono::duration_cast<std::chrono::milliseconds>(
-                      preference_end - preference_start)
-                      .count(),
-                  std::chrono::duration_cast<std::chrono::milliseconds>(
-                      preference_end - start)
-                      .count());
+      RCLCPP_INFO(
+        this->get_logger(),
+        "Timing(GetNextSubgoal): safety_image=%ld ms, "
+        "connected=%ld ms, candidates=%ld ms, extract=%ld ms, "
+        "goal_scores=%ld ms, expansion=%ld ms, pareto=%ld ms, "
+        "preference=%ld ms, total=%ld ms",
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          safety_image_end - safety_image_start)
+        .count(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          connected_end - connected_start)
+        .count(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          candidate_end - candidate_start)
+        .count(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          frontier_extract_end - frontier_extract_start)
+        .count(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          expansion_start - goal_scores_start)
+        .count(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          expansion_end - expansion_start)
+        .count(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          pareto_end - pareto_start)
+        .count(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          preference_end - preference_start)
+        .count(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          preference_end - start)
+        .count());
+      if (best_index >= 0) {
+        return candidate_indices[best_index];
+      }
       return frontier_indices.front();
     }
 
-    if (best_index < 0) {
-      RCLCPP_WARN(this->get_logger(),
-                  "Failed to select frontier point near goal");
-      return -1;
-    }
-
-    return frontier_indices[best_index];
+    return best->data_index;
   }
 
-  void spatial_data_size_callback(const std_msgs::msg::Int32::SharedPtr msg) {
+  void spatial_data_size_callback(const std_msgs::msg::Int32::SharedPtr msg)
+  {
     int current_size = msg->data;
-    
+
     // Only process if the size has changed
     if (current_size != last_spatial_data_size_) {
-      RCLCPP_INFO(this->get_logger(),
-                  "Spatial data size changed: %d -> %d",
-                  last_spatial_data_size_, current_size);
-      
+      RCLCPP_INFO(
+        this->get_logger(),
+        "Spatial data size changed: %d -> %d",
+        last_spatial_data_size_, current_size);
+
       last_spatial_data_size_ = current_size;
-      
+
       // Update terrain map if update_on_measurement is enabled
       if (update_on_measurement_) {
-        RCLCPP_INFO(this->get_logger(),
-                    "Update on measurement enabled; requesting terrain map update "
-                    "(safe sets will update, but subgoal remains until reached)");
+        RCLCPP_INFO(
+          this->get_logger(),
+          "Update on measurement enabled; requesting terrain map update "
+          "(safe sets will update, but subgoal remains until reached)");
         // Do NOT set new_subgoal_requested_ here: the current subgoal should
         // persist until the robot explicitly reaches it (subgoal_reached_callback).
         // The terrain map, safe sets, polygons, etc. will still be recomputed.
         request_terrain_map();
       } else {
         // Defer terrain map updates until the subgoal is reached.
-        RCLCPP_DEBUG(this->get_logger(),
-                     "Update on measurement disabled; deferring terrain map update until subgoal reached");
+        RCLCPP_DEBUG(
+          this->get_logger(),
+          "Update on measurement disabled; deferring terrain map update until subgoal reached");
       }
     }
   }
 
-  void subgoal_reached_callback(const std_msgs::msg::Empty::SharedPtr) {
-    RCLCPP_INFO(this->get_logger(),
-                "Subgoal reached; requesting terrain map update");
+  void subgoal_reached_callback(const std_msgs::msg::Empty::SharedPtr)
+  {
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Subgoal reached; requesting terrain map update");
     new_subgoal_requested_ = true;
     request_terrain_map();
   }
 
-  void robot_pose_callback(const geometry_msgs::msg::Pose::SharedPtr msg) {
+  void robot_pose_callback(const geometry_msgs::msg::Pose::SharedPtr msg)
+  {
     current_robot_position_ = msg->position;
     has_robot_pose_ = true;
   }
 
-  void request_terrain_map() {
+  void request_terrain_map()
+  {
     if (!terrain_map_client_->wait_for_service(std::chrono::seconds(0))) {
       RCLCPP_WARN(this->get_logger(), "Terrain map service not available");
       return;
@@ -1059,16 +1119,17 @@ private:
     RCLCPP_INFO(this->get_logger(), "Requesting terrain map...");
 
     auto request =
-        std::make_shared<trusses_custom_interfaces::srv::
-                             GetTerrainMapWithUncertainty::Request>();
+      std::make_shared<trusses_custom_interfaces::srv::
+        GetTerrainMapWithUncertainty::Request>();
     // Use the resolution array field from the service interface
     request->resolution = {static_cast<float>(terrain_x_resolution_),
-                           static_cast<float>(terrain_y_resolution_)};
+      static_cast<float>(terrain_y_resolution_)};
 
-    RCLCPP_INFO(this->get_logger(),
-                "Requesting terrain map with resolution: [%.2f, %.2f] "
-                "(service will calculate dimensions from data bounds)",
-                terrain_x_resolution_, terrain_y_resolution_);
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Requesting terrain map with resolution: [%.2f, %.2f] "
+      "(service will calculate dimensions from data bounds)",
+      terrain_x_resolution_, terrain_y_resolution_);
 
     // Start timing the terrain map request
     terrain_request_start_time_ = std::chrono::steady_clock::now();
@@ -1076,48 +1137,80 @@ private:
 
     // Use callback-based async call
     terrain_map_client_->async_send_request(
-        request,
-        [this](rclcpp::Client<
-               trusses_custom_interfaces::srv::GetTerrainMapWithUncertainty>::
-                   SharedFuture future) {
-          // Calculate terrain map request duration
-          auto end_time = std::chrono::steady_clock::now();
-          auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-              end_time - terrain_request_start_time_);
-          
-          RCLCPP_INFO(this->get_logger(), 
-                      "Terrain map request completed in %ld ms", duration.count());
-          
-          auto response = future.get();
-          if (response->success) {
-            RCLCPP_INFO(this->get_logger(), "Received terrain map: %s",
-                        response->message.c_str());
+      request,
+      [this](rclcpp::Client<
+        trusses_custom_interfaces::srv::GetTerrainMapWithUncertainty>::
+      SharedFuture future) {
+        // Calculate terrain map request duration
+        auto end_time = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+          end_time - terrain_request_start_time_);
 
-            // Store grid dimensions for later use
-            terrain_width_cells_ = response->n_width_cells;
-            terrain_height_cells_ = response->n_height_cells;
+        RCLCPP_INFO(
+          this->get_logger(),
+          "Terrain map request completed in %ld ms", duration.count());
 
-            // Process the terrain map data here
-            process_terrain_map(response);
+        auto response = future.get();
+        if (response->success) {
+          RCLCPP_INFO(
+            this->get_logger(), "Received terrain map: %s",
+            response->message.c_str());
 
-          } else {
-            RCLCPP_WARN(this->get_logger(), "Terrain map request failed: %s",
-                        response->message.c_str());
-          }
-        });
+          // Process the terrain map data here
+          process_terrain_map(response);
+
+        } else {
+          RCLCPP_WARN(
+            this->get_logger(), "Terrain map request failed: %s",
+            response->message.c_str());
+        }
+      });
+  }
+
+
+  bool ValidateTerrainMapResponse(
+    const std::shared_ptr<const trusses_custom_interfaces::srv::
+    GetTerrainMapWithUncertainty::Response>
+    response) const
+  {
+    const size_t x_size = response->x_coords.size();
+    const size_t y_size = response->y_coords.size();
+    const size_t values_size = response->values.size();
+    const size_t uncertainties_size = response->uncertainties.size();
+
+    if (x_size != y_size || x_size != values_size ||
+      x_size != uncertainties_size)
+    {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "Rejecting terrain map with mismatched array sizes: x=%zu, y=%zu, values=%zu, uncertainties=%zu",
+        x_size, y_size, values_size, uncertainties_size);
+      return false;
+    }
+
+    // The terrain service may return sparse point sets, so do not require
+    // n_width_cells * n_height_cells to equal the point count here.
+    return true;
   }
 
   void process_terrain_map(
-      const std::shared_ptr<const trusses_custom_interfaces::srv::
-                                GetTerrainMapWithUncertainty::Response>
-          response) {
+    const std::shared_ptr<const trusses_custom_interfaces::srv::
+    GetTerrainMapWithUncertainty::Response>
+    response)
+  {
     const auto process_start = std::chrono::steady_clock::now();
+
+    if (!ValidateTerrainMapResponse(response)) {
+      return;
+    }
+
+    const size_t num_points = response->x_coords.size();
+    terrain_width_cells_ = response->n_width_cells;
+    terrain_height_cells_ = response->n_height_cells;
     has_terrain_map_ = true;
 
     // Update the parameter set D_, mean mu_, and std_ with the new terrain map
     // data
-    const size_t num_points = response->x_coords.size();
-
     D_.resize(num_points, 2);
     mu_.resize(num_points);
     std_.resize(num_points);
@@ -1133,14 +1226,16 @@ private:
 
     const auto compute_sets_start = std::chrono::steady_clock::now();
     // Recompute sets with new data
-    RCLCPP_INFO(this->get_logger(), 
-                "Updating safe set with %zu data points (update_on_measurement=%s)",
-                num_points, update_on_measurement_ ? "true" : "false");
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Updating safe set with %zu data points (update_on_measurement=%s)",
+      num_points, update_on_measurement_ ? "true" : "false");
     ComputeSets();
     const auto compute_sets_end = std::chrono::steady_clock::now();
     int safe_count = S_.count();
-    RCLCPP_INFO(this->get_logger(), 
-                "Safe set updated: %d/%zu points are safe", safe_count, num_points);
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Safe set updated: %d/%zu points are safe", safe_count, num_points);
 
     const auto publish_polygons_start = std::chrono::steady_clock::now();
     publish_obstacle_polygons();
@@ -1149,167 +1244,121 @@ private:
     const auto subgoal_start = std::chrono::steady_clock::now();
     const bool should_select_subgoal = new_subgoal_requested_ || !last_subgoal_valid_;
     if (should_select_subgoal) {
-      // Check if the goal itself is safe by checking if it's within the eroded
-      // polygon
       bg::model::d2::point_xy<double> goal_point(current_goal_.point.x,
-                                                 current_goal_.point.y);
+        current_goal_.point.y);
 
       geometry_msgs::msg::Point subgoal;
       if (goal_received_ && bg::within(goal_point, eroded_concave_polygon_)) {
-        // Goal is safe, use it directly as the subgoal
         subgoal.x = current_goal_.point.x;
         subgoal.y = current_goal_.point.y;
         subgoal.z = 0.0;
 
-    // Check if the goal itself is safe by checking if it's within the eroded
-    // polygon
-    bg::model::d2::point_xy<double> goal_point(current_goal_.point.x,
-                                               current_goal_.point.y);
-
-    geometry_msgs::msg::Point subgoal;
-    if (goal_received_ && bg::within(goal_point, eroded_concave_polygon_)) {
-      // Goal is safe, use it directly as the subgoal
-      subgoal.x = current_goal_.point.x;
-      subgoal.y = current_goal_.point.y;
-      subgoal.z = 0.0;
-
-      RCLCPP_INFO(
+        RCLCPP_INFO(
           this->get_logger(),
           "Goal is within eroded safe region, using goal as subgoal: (%f, %f)",
           subgoal.x, subgoal.y);
-    } else {
-      if (!goal_received_) {
-        RCLCPP_INFO(this->get_logger(),
-                    "No goal available; selecting frontier with highest uncertainty");
-      }
-      // Goal is not safe, find frontier subgoal and project it
-      const int next_subgoal_index = GetNextSubgoal();
-      if (next_subgoal_index >= 0) {
-        // Get the raw subgoal from the terrain map
-        double raw_x = response->x_coords[next_subgoal_index];
-        double raw_y = response->y_coords[next_subgoal_index];
-
-        // Convert boost polygon to polygeom_lib polygon format
-        polygon eroded_poly_for_projection;
-        for (const auto &boost_point : eroded_concave_polygon_.outer()) {
-          point polygeom_point(boost_point.get<0>(), boost_point.get<1>());
-          eroded_poly_for_projection.outer().push_back(polygeom_point);
+      } else {
+        if (!goal_received_) {
+          RCLCPP_INFO(
+            this->get_logger(),
+            "No goal available; selecting frontier with highest uncertainty");
         }
+
         const auto get_subgoal_start = std::chrono::steady_clock::now();
-        // Goal is not safe, find frontier subgoal and project it
         const int next_subgoal_index = GetNextSubgoal();
         const auto get_subgoal_end = std::chrono::steady_clock::now();
-        if (next_subgoal_index >= 0) {
-          // Get the raw subgoal from the terrain map
-          double raw_x = response->x_coords[next_subgoal_index];
-          double raw_y = response->y_coords[next_subgoal_index];
-
-          // Convert boost polygon to polygeom_lib polygon format
-          polygon eroded_poly_for_projection;
-          for (const auto &boost_point : eroded_concave_polygon_.outer()) {
-            point polygeom_point(boost_point.get<0>(), boost_point.get<1>());
-            eroded_poly_for_projection.outer().push_back(polygeom_point);
-          }
-
-          bg::correct(eroded_poly_for_projection);
-
-          RCLCPP_INFO(this->get_logger(),
-                      "Next subgoal index: %d, coordinates: (%f, %f)",
-                      next_subgoal_index, raw_x, raw_y);
-
-          // Create point from raw subgoal coordinates
-          point raw_subgoal_point(raw_x, raw_y);
-
-          // Project the subgoal onto the eroded safe region using polydist
-          const auto project_start = std::chrono::steady_clock::now();
-          ProjectionResultStruct projection_result =
-              polydist(eroded_poly_for_projection, raw_subgoal_point);
-          const auto project_end = std::chrono::steady_clock::now();
-
-          RCLCPP_INFO(this->get_logger(),
-                      "Projected subgoal point: (%f, %f), distance: %f",
-                      projection_result.projected_point.get<0>(),
-                      projection_result.projected_point.get<1>(),
-                      projection_result.dist);
-
-          // Create final subgoal message from projected point
-          subgoal.x = projection_result.projected_point.get<0>();
-          subgoal.y = projection_result.projected_point.get<1>();
-          subgoal.z = 0.0;
-
-          // Publish visualization of the projection when a goal is available
-          if (goal_received_) {
-            const auto marker_start = std::chrono::steady_clock::now();
-            publish_projected_goal_marker(current_goal_.point, subgoal,
-                                          projection_result.dist);
-            const auto marker_end = std::chrono::steady_clock::now();
-            RCLCPP_INFO(this->get_logger(),
-                        "Timing: publish_projected_goal_marker=%ld ms",
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            marker_end - marker_start)
-                            .count());
-          }
-
-          RCLCPP_INFO(this->get_logger(),
-                      "Published projected subgoal: (%f, %f) (distance: %f)",
-                      subgoal.x, subgoal.y, projection_result.dist);
-          RCLCPP_INFO(this->get_logger(),
-                      "Timing: GetNextSubgoal=%ld ms, polydist=%ld ms",
-                      std::chrono::duration_cast<std::chrono::milliseconds>(
-                          get_subgoal_end - get_subgoal_start)
-                          .count(),
-                      std::chrono::duration_cast<std::chrono::milliseconds>(
-                          project_end - project_start)
-                          .count());
-        } else {
+        if (next_subgoal_index < 0) {
           RCLCPP_WARN(this->get_logger(), "No valid subgoal found");
           return;
         }
-      }
-      current_subgoal_pub_->publish(subgoal);
 
-        // Publish visualization of the projection when a goal is available
+        const double raw_x = response->x_coords[next_subgoal_index];
+        const double raw_y = response->y_coords[next_subgoal_index];
+
+        polygon eroded_poly_for_projection;
+        for (const auto & boost_point : eroded_concave_polygon_.outer()) {
+          point polygeom_point(boost_point.get<0>(), boost_point.get<1>());
+          eroded_poly_for_projection.outer().push_back(polygeom_point);
+        }
+        bg::correct(eroded_poly_for_projection);
+
+        RCLCPP_INFO(
+          this->get_logger(),
+          "Next subgoal index: %d, coordinates: (%f, %f)",
+          next_subgoal_index, raw_x, raw_y);
+
+        point raw_subgoal_point(raw_x, raw_y);
+        const auto project_start = std::chrono::steady_clock::now();
+        ProjectionResultStruct projection_result =
+          polydist(eroded_poly_for_projection, raw_subgoal_point);
+        const auto project_end = std::chrono::steady_clock::now();
+
+        subgoal.x = projection_result.projected_point.get<0>();
+        subgoal.y = projection_result.projected_point.get<1>();
+        subgoal.z = 0.0;
+
         if (goal_received_) {
-          publish_projected_goal_marker(current_goal_.point, subgoal,
-                                        projection_result.dist);
+          publish_projected_goal_marker(
+            current_goal_.point, subgoal,
+            projection_result.dist);
         }
 
+        RCLCPP_INFO(
+          this->get_logger(),
+          "Published projected subgoal: (%f, %f) (distance: %f)",
+          subgoal.x, subgoal.y, projection_result.dist);
+        RCLCPP_INFO(
+          this->get_logger(),
+          "Timing: GetNextSubgoal=%ld ms, polydist=%ld ms",
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+            get_subgoal_end - get_subgoal_start)
+          .count(),
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+            project_end - project_start)
+          .count());
+      }
+
+      current_subgoal_pub_->publish(subgoal);
       last_subgoal_ = subgoal;
       last_subgoal_valid_ = true;
       new_subgoal_requested_ = false;
       if (goal_received_ && !preference_order_.empty()) {
         preference_index_ =
-            (preference_index_ + 1) % preference_order_.size();
+          (preference_index_ + 1) % preference_order_.size();
       }
     } else {
-      RCLCPP_INFO(this->get_logger(),
-                  "Map update received; keeping current subgoal until reached");
+      RCLCPP_INFO(
+        this->get_logger(),
+        "Map update received; keeping current subgoal until reached");
     }
     const auto subgoal_end = std::chrono::steady_clock::now();
 
     const auto process_end = std::chrono::steady_clock::now();
-    RCLCPP_INFO(this->get_logger(),
-                "Timing: process_terrain_map=%ld ms, ComputeSets=%ld ms, "
-                "publish_obstacle_polygons=%ld ms, subgoal_block=%ld ms",
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    process_end - process_start)
-                    .count(),
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    compute_sets_end - compute_sets_start)
-                    .count(),
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    publish_polygons_end - publish_polygons_start)
-                    .count(),
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    subgoal_end - subgoal_start)
-                    .count());
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Timing: process_terrain_map=%ld ms, ComputeSets=%ld ms, "
+      "publish_obstacle_polygons=%ld ms, subgoal_block=%ld ms",
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        process_end - process_start)
+      .count(),
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        compute_sets_end - compute_sets_start)
+      .count(),
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        publish_polygons_end - publish_polygons_start)
+      .count(),
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        subgoal_end - subgoal_start)
+      .count());
   }
 
   bg::model::polygon<bg::model::d2::point_xy<double>>
-  create_concave_polygon_from_points(const std::vector<int> &point_indices) {
-    RCLCPP_INFO(this->get_logger(),
-                "[POLYGON] Creating concave polygon from %zu points",
-                point_indices.size());
+  create_concave_polygon_from_points(const std::vector<int> & point_indices)
+  {
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[POLYGON] Creating concave polygon from %zu points",
+      point_indices.size());
 
     // Use CGAL Alpha Shape instead of concaveman
     typedef CGAL::Exact_predicates_inexact_constructions_kernel K;
@@ -1328,9 +1377,9 @@ private:
 
     if (cgal_points.size() < 3) {
       RCLCPP_WARN(
-          this->get_logger(),
-          "[POLYGON] Insufficient points (%zu) for polygon, returning empty",
-          cgal_points.size());
+        this->get_logger(),
+        "[POLYGON] Insufficient points (%zu) for polygon, returning empty",
+        cgal_points.size());
       return bg::model::polygon<bg::model::d2::point_xy<double>>();
     }
 
@@ -1340,49 +1389,55 @@ private:
 
     // Find optimal alpha value - start with infinity (convex hull) and work down
     alpha_shape.set_alpha(std::numeric_limits<double>::infinity());
-    
+
     // Get all possible alpha values in descending order
     std::vector<double> alpha_values;
-    for (auto alpha_it = alpha_shape.alpha_begin(); alpha_it != alpha_shape.alpha_end(); ++alpha_it) {
+    for (auto alpha_it = alpha_shape.alpha_begin(); alpha_it != alpha_shape.alpha_end();
+      ++alpha_it)
+    {
       if (*alpha_it > 0) {
         alpha_values.push_back(*alpha_it);
       }
     }
     std::sort(alpha_values.rbegin(), alpha_values.rend()); // Sort in descending order
-    
+
     // Find the largest alpha that includes all points
     bool found_valid_alpha = false;
     for (double alpha_val : alpha_values) {
       alpha_shape.set_alpha(alpha_val);
-      
+
       // Count vertices in the alpha shape
       int vertex_count = 0;
       for (auto vertex_it = alpha_shape.alpha_shape_vertices_begin();
-           vertex_it != alpha_shape.alpha_shape_vertices_end(); ++vertex_it) {
+        vertex_it != alpha_shape.alpha_shape_vertices_end(); ++vertex_it)
+      {
         vertex_count++;
       }
-      
+
       // If this alpha includes all or most points (at least 90%), use it
       if (vertex_count >= static_cast<int>(cgal_points.size() * 0.9)) {
         found_valid_alpha = true;
-        RCLCPP_INFO(this->get_logger(), 
-                    "[POLYGON] Using alpha=%f, includes %d/%zu vertices", 
-                    alpha_val, vertex_count, cgal_points.size());
+        RCLCPP_INFO(
+          this->get_logger(),
+          "[POLYGON] Using alpha=%f, includes %d/%zu vertices",
+          alpha_val, vertex_count, cgal_points.size());
         break;
       }
     }
-    
+
     if (!found_valid_alpha) {
       // Fallback to a very large alpha to ensure we get most points
       alpha_shape.set_alpha(std::numeric_limits<double>::infinity());
-      RCLCPP_WARN(this->get_logger(), 
-                  "[POLYGON] Using convex hull (alpha=infinity) as fallback");
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[POLYGON] Using convex hull (alpha=infinity) as fallback");
     }
 
     // Collect boundary edges
     std::vector<typename Alpha_shape_2::Edge> boundary_edges;
     for (auto edge_it = alpha_shape.alpha_shape_edges_begin();
-         edge_it != alpha_shape.alpha_shape_edges_end(); ++edge_it) {
+      edge_it != alpha_shape.alpha_shape_edges_end(); ++edge_it)
+    {
       boundary_edges.push_back(*edge_it);
     }
 
@@ -1393,7 +1448,7 @@ private:
       std::map<Point_2, std::vector<Point_2>> adjacency_map;
 
       // Build adjacency map from boundary edges
-      for (const auto &edge : boundary_edges) {
+      for (const auto & edge : boundary_edges) {
         auto face = edge.first;
         int idx = edge.second;
         Point_2 p1 = face->vertex((idx + 1) % 3)->point();
@@ -1412,53 +1467,61 @@ private:
           ordered_boundary.push_back(current);
           visited.insert(current);
           Point_2 next = current;
-          for (const auto &neighbor : adjacency_map[current]) {
+          for (const auto & neighbor : adjacency_map[current]) {
             if (visited.find(neighbor) == visited.end() ||
-                (neighbor == start_point && ordered_boundary.size() > 2)) {
+              (neighbor == start_point && ordered_boundary.size() > 2))
+            {
               next = neighbor;
               break;
             }
           }
           current = next;
         } while (current != start_point &&
-                 visited.find(current) == visited.end() &&
-                 ordered_boundary.size() < adjacency_map.size());
+        visited.find(current) == visited.end() &&
+        ordered_boundary.size() < adjacency_map.size());
       }
 
       // Convert ordered boundary to boost geometry polygon
-      for (const auto &point : ordered_boundary) {
-        bg::append(concave_polygon.outer(),
-                   bg::model::d2::point_xy<double>(CGAL::to_double(point.x()),
-                                                   CGAL::to_double(point.y())));
+      for (const auto & point : ordered_boundary) {
+        bg::append(
+          concave_polygon.outer(),
+          bg::model::d2::point_xy<double>(
+            CGAL::to_double(point.x()),
+            CGAL::to_double(point.y())));
       }
     } else {
       // Fallback: use all points
-      for (const auto &point : cgal_points) {
-        bg::append(concave_polygon.outer(),
-                   bg::model::d2::point_xy<double>(CGAL::to_double(point.x()),
-                                                   CGAL::to_double(point.y())));
+      for (const auto & point : cgal_points) {
+        bg::append(
+          concave_polygon.outer(),
+          bg::model::d2::point_xy<double>(
+            CGAL::to_double(point.x()),
+            CGAL::to_double(point.y())));
       }
     }
 
     bg::correct(concave_polygon);
-    
+
     // Simplify the concave polygon with tolerance 0.1
     bg::model::polygon<bg::model::d2::point_xy<double>> simplified_polygon;
     bg::simplify(concave_polygon, simplified_polygon, 0.1);
-    
+
     return simplified_polygon;
   }
 
-  void publish_obstacle_polygons() {
-    RCLCPP_INFO(this->get_logger(),
-                "[MAIN] Starting publish_obstacle_polygons()");
+  void publish_obstacle_polygons()
+  {
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[MAIN] Starting publish_obstacle_polygons()");
 
     int safe_count = S_.count();
     RCLCPP_INFO(this->get_logger(), "[MAIN] Total safe points: %d", safe_count);
 
     if (safe_count == 0) {
-      RCLCPP_WARN(this->get_logger(),
-                  "[MAIN] No safe points available for polygon generation");
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[MAIN] No safe points available for polygon generation");
       return;
     }
 
@@ -1475,27 +1538,9 @@ private:
     int width = terrain_width_cells_;
     int height = terrain_height_cells_;
 
-    RCLCPP_INFO(this->get_logger(), "[MAIN] Grid bounds: X=[%.2f, %.2f], Y=[%.2f, %.2f], size=%dx%d",
-                min_x, max_x, min_y, max_y, width, height);
-
-    // Create binary image from safety data
-    cv::Mat safety_image = cv::Mat::zeros(height, width, CV_8UC1);
-
-    // Create polygons with holes using OpenCV contours (more efficient than Alpha Shapes)
-    RCLCPP_INFO(this->get_logger(), "[MAIN] Creating safe region polygons from contours...");
-
-    // Find grid bounds
-    double min_x = D_.col(0).minCoeff();
-    double max_x = D_.col(0).maxCoeff();
-    double min_y = D_.col(1).minCoeff();
-    double max_y = D_.col(1).maxCoeff();
-
-    // Use stored grid dimensions from service response
-    int width = terrain_width_cells_;
-    int height = terrain_height_cells_;
-
-    RCLCPP_INFO(this->get_logger(), "[MAIN] Grid bounds: X=[%.2f, %.2f], Y=[%.2f, %.2f], size=%dx%d",
-                min_x, max_x, min_y, max_y, width, height);
+    RCLCPP_INFO(
+      this->get_logger(), "[MAIN] Grid bounds: X=[%.2f, %.2f], Y=[%.2f, %.2f], size=%dx%d",
+      min_x, max_x, min_y, max_y, width, height);
 
     // Create binary image from safety data
     cv::Mat safety_image = cv::Mat::zeros(height, width, CV_8UC1);
@@ -1512,9 +1557,10 @@ private:
     // Find contours with hierarchy to detect holes
     std::vector<std::vector<cv::Point>> contours;
     std::vector<cv::Vec4i> hierarchy;
-    cv::findContours(safety_image, contours, hierarchy,
-                     cv::RETR_CCOMP,  // Retrieves all contours and organizes them into a two-level hierarchy
-                     cv::CHAIN_APPROX_SIMPLE);  // Compresses segments for efficiency
+    cv::findContours(
+      safety_image, contours, hierarchy,
+      cv::RETR_CCOMP,                 // Retrieves all contours and organizes them into a two-level hierarchy
+      cv::CHAIN_APPROX_SIMPLE);                 // Compresses segments for efficiency
 
     RCLCPP_INFO(this->get_logger(), "[MAIN] Found %zu contours from OpenCV", contours.size());
 
@@ -1523,7 +1569,7 @@ private:
     // parent == -1: outer boundary (safe region)
     // parent >= 0: hole (unsafe island inside safe region)
     std::vector<bg::model::polygon<bg::model::d2::point_xy<double>>>
-        concave_polygons;
+    concave_polygons;
     std::vector<std::array<double, 2>> all_boundaries;
 
     for (size_t i = 0; i < contours.size(); ++i) {
@@ -1532,30 +1578,33 @@ private:
         bg::model::polygon<bg::model::d2::point_xy<double>> poly;
 
         // Add outer boundary
-        for (const auto& pt : contours[i]) {
+        for (const auto & pt : contours[i]) {
           double world_x = min_x + (pt.x / (double)width) * (max_x - min_x);
           double world_y = min_y + (pt.y / (double)height) * (max_y - min_y);
           bg::append(poly.outer(), bg::model::d2::point_xy<double>(world_x, world_y));
           all_boundaries.push_back({world_x, world_y});
         }
 
-        RCLCPP_INFO(this->get_logger(), "[MAIN] Outer boundary %zu has %zu points",
-                    i, contours[i].size());
+        RCLCPP_INFO(
+          this->get_logger(), "[MAIN] Outer boundary %zu has %zu points",
+          i, contours[i].size());
 
         // Find and add holes (children of this outer boundary)
         int hole_count = 0;
         for (size_t j = 0; j < contours.size(); ++j) {
           if (hierarchy[j][3] == (int)i) {  // This contour's parent is current outer boundary
             poly.inners().resize(poly.inners().size() + 1);
-            for (const auto& pt : contours[j]) {
+            for (const auto & pt : contours[j]) {
               double world_x = min_x + (pt.x / (double)width) * (max_x - min_x);
               double world_y = min_y + (pt.y / (double)height) * (max_y - min_y);
-              bg::append(poly.inners().back(),
-                        bg::model::d2::point_xy<double>(world_x, world_y));
+              bg::append(
+                poly.inners().back(),
+                bg::model::d2::point_xy<double>(world_x, world_y));
             }
             hole_count++;
-            RCLCPP_INFO(this->get_logger(), "[MAIN]   Hole %d has %zu points",
-                        hole_count, contours[j].size());
+            RCLCPP_INFO(
+              this->get_logger(), "[MAIN]   Hole %d has %zu points",
+              hole_count, contours[j].size());
           }
         }
 
@@ -1564,38 +1613,42 @@ private:
 
         if (!poly.outer().empty()) {
           concave_polygons.push_back(poly);
-          RCLCPP_INFO(this->get_logger(),
-                      "[MAIN] Created polygon with %zu outer points and %zu holes",
-                      poly.outer().size(), poly.inners().size());
+          RCLCPP_INFO(
+            this->get_logger(),
+            "[MAIN] Created polygon with %zu outer points and %zu holes",
+            poly.outer().size(), poly.inners().size());
         }
       }
     }
 
     if (concave_polygons.empty()) {
-      RCLCPP_WARN(this->get_logger(),
-                  "[MAIN] No valid polygons created from contours");
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[MAIN] No valid polygons created from contours");
       return;
     }
 
-    RCLCPP_INFO(this->get_logger(),
-                "[MAIN] Successfully created %zu safe region polygons using OpenCV contours",
-                concave_polygons.size());
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[MAIN] Successfully created %zu safe region polygons using OpenCV contours",
+      concave_polygons.size());
 
     // Apply conservative simplification: erode THEN simplify
     // This guarantees safe regions only shrink → obstacles only grow
-    RCLCPP_INFO(this->get_logger(),
-                "[MAIN] Applying conservative polygon simplification (tolerance=%.3fm)...",
-                simplification_tolerance_);
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[MAIN] Applying conservative polygon simplification (tolerance=%.3fm)...",
+      simplification_tolerance_);
 
     double safety_erosion = 1.5 * simplification_tolerance_;  // Conservative: erode by 1.5x tolerance
 
     std::vector<bg::model::polygon<bg::model::d2::point_xy<double>>>
-        simplified_polygons;
+    simplified_polygons;
 
     for (size_t i = 0; i < concave_polygons.size(); ++i) {
       size_t orig_outer_vertices = concave_polygons[i].outer().size();
       size_t orig_inner_vertices = 0;
-      for (const auto& inner : concave_polygons[i].inners()) {
+      for (const auto & inner : concave_polygons[i].inners()) {
         orig_inner_vertices += inner.size();
       }
 
@@ -1612,52 +1665,57 @@ private:
 
       bg::strategy::buffer::distance_symmetric<double> erosion_distance(-safety_erosion);
       bg::model::multi_polygon<bg::model::polygon<bg::model::d2::point_xy<double>>>
-          eroded_outer_multi;
-      bg::buffer(outer_only, eroded_outer_multi, erosion_distance,
-                 side_strategy, join_strategy, end_strategy, point_strategy);
+      eroded_outer_multi;
+      bg::buffer(
+        outer_only, eroded_outer_multi, erosion_distance,
+        side_strategy, join_strategy, end_strategy, point_strategy);
 
       if (eroded_outer_multi.empty()) {
-        RCLCPP_WARN(this->get_logger(),
-                    "[MAIN] Polygon %zu outer boundary disappeared after erosion - skipping", i);
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[MAIN] Polygon %zu outer boundary disappeared after erosion - skipping", i);
         continue;
       }
 
       // Step 2: Dilate holes (expand unsafe regions inside)
       std::vector<bg::model::polygon<bg::model::d2::point_xy<double>>> dilated_holes;
 
-      for (const auto& hole : concave_polygons[i].inners()) {
+      for (const auto & hole : concave_polygons[i].inners()) {
         bg::model::polygon<bg::model::d2::point_xy<double>> hole_poly;
         hole_poly.outer() = hole;
         bg::correct(hole_poly);
 
         bg::strategy::buffer::distance_symmetric<double> dilation_distance(safety_erosion);
         bg::model::multi_polygon<bg::model::polygon<bg::model::d2::point_xy<double>>>
-            dilated_hole_multi;
-        bg::buffer(hole_poly, dilated_hole_multi, dilation_distance,
-                   side_strategy, join_strategy, end_strategy, point_strategy);
+        dilated_hole_multi;
+        bg::buffer(
+          hole_poly, dilated_hole_multi, dilation_distance,
+          side_strategy, join_strategy, end_strategy, point_strategy);
 
         if (!dilated_hole_multi.empty()) {
           dilated_holes.push_back(dilated_hole_multi[0]);
         }
       }
 
-      RCLCPP_INFO(this->get_logger(),
-                  "[MAIN] Polygon %zu: outer eroded, %zu holes dilated",
-                  i, dilated_holes.size());
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[MAIN] Polygon %zu: outer eroded, %zu holes dilated",
+        i, dilated_holes.size());
 
       // Step 3: Simplify outer boundary
       bg::model::polygon<bg::model::d2::point_xy<double>> simplified_outer;
       bg::simplify(eroded_outer_multi[0], simplified_outer, simplification_tolerance_);
 
       if (simplified_outer.outer().empty()) {
-        RCLCPP_WARN(this->get_logger(),
-                    "[MAIN] Polygon %zu outer disappeared after simplification - skipping", i);
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[MAIN] Polygon %zu outer disappeared after simplification - skipping", i);
         continue;
       }
 
       // Step 4: Simplify holes
       std::vector<bg::model::polygon<bg::model::d2::point_xy<double>>> simplified_holes;
-      for (const auto& dilated_hole : dilated_holes) {
+      for (const auto & dilated_hole : dilated_holes) {
         bg::model::polygon<bg::model::d2::point_xy<double>> simplified_hole;
         bg::simplify(dilated_hole, simplified_hole, simplification_tolerance_);
 
@@ -1671,7 +1729,7 @@ private:
       final_poly.outer() = simplified_outer.outer();
 
       // Add simplified holes as inner rings
-      for (const auto& hole : simplified_holes) {
+      for (const auto & hole : simplified_holes) {
         final_poly.inners().push_back(hole.outer());
       }
 
@@ -1680,37 +1738,41 @@ private:
       if (!final_poly.outer().empty()) {
         size_t final_outer_vertices = final_poly.outer().size();
         size_t final_inner_vertices = 0;
-        for (const auto& inner : final_poly.inners()) {
+        for (const auto & inner : final_poly.inners()) {
           final_inner_vertices += inner.size();
         }
 
         simplified_polygons.push_back(final_poly);
 
-        RCLCPP_INFO(this->get_logger(),
-                    "[MAIN] Polygon %zu: vertices %zu→%zu (outer), %zu→%zu (inner holes), reduction: %.1f%%",
-                    i, orig_outer_vertices, final_outer_vertices,
-                    orig_inner_vertices, final_inner_vertices,
-                    100.0 * (1.0 - (double)(final_outer_vertices + final_inner_vertices) /
-                             (double)(orig_outer_vertices + orig_inner_vertices)));
+        RCLCPP_INFO(
+          this->get_logger(),
+          "[MAIN] Polygon %zu: vertices %zu→%zu (outer), %zu→%zu (inner holes), reduction: %.1f%%",
+          i, orig_outer_vertices, final_outer_vertices,
+          orig_inner_vertices, final_inner_vertices,
+          100.0 * (1.0 - (double)(final_outer_vertices + final_inner_vertices) /
+          (double)(orig_outer_vertices + orig_inner_vertices)));
       }
     }
 
     if (simplified_polygons.empty()) {
-      RCLCPP_WARN(this->get_logger(),
-                  "[MAIN] All polygons disappeared after simplification - using originals");
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[MAIN] All polygons disappeared after simplification - using originals");
       simplified_polygons = concave_polygons;
     } else {
-      RCLCPP_INFO(this->get_logger(),
-                  "[MAIN] Successfully simplified %zu→%zu polygons with safety guarantee",
-                  concave_polygons.size(), simplified_polygons.size());
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[MAIN] Successfully simplified %zu→%zu polygons with safety guarantee",
+        concave_polygons.size(), simplified_polygons.size());
     }
 
     // Use simplified polygons for remaining operations
     concave_polygons = simplified_polygons;
 
     // Find the largest polygon for subgoal projection (or use first one)
-    RCLCPP_INFO(this->get_logger(),
-                "[MAIN] Finding largest polygon for subgoal projection...");
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[MAIN] Finding largest polygon for subgoal projection...");
     size_t largest_polygon_idx = 0;
     double largest_area = 0.0;
     for (size_t i = 0; i < concave_polygons.size(); ++i) {
@@ -1721,50 +1783,56 @@ private:
         largest_polygon_idx = i;
       }
     }
-    RCLCPP_INFO(this->get_logger(),
-                "[MAIN] Selected polygon %zu as largest (area: %f)",
-                largest_polygon_idx, largest_area);
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[MAIN] Selected polygon %zu as largest (area: %f)",
+      largest_polygon_idx, largest_area);
 
     // Erode the largest concave polygon for safe subgoal placement
-    RCLCPP_INFO(this->get_logger(),
-                "[MAIN] Eroding largest polygon for subgoal projection...");
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[MAIN] Eroding largest polygon for subgoal projection...");
     bg::strategy::buffer::distance_symmetric<double> erosion_distance(
-        -subgoal_erosion_);
+      -subgoal_erosion_);
     bg::strategy::buffer::join_round join_strategy;
     bg::strategy::buffer::end_round end_strategy;
     bg::strategy::buffer::point_circle point_strategy;
     bg::strategy::buffer::side_straight side_strategy;
 
     bg::model::multi_polygon<
-        bg::model::polygon<bg::model::d2::point_xy<double>>>
-        eroded_multi;
-    bg::buffer(concave_polygons[largest_polygon_idx], eroded_multi,
-               erosion_distance, side_strategy, join_strategy, end_strategy,
-               point_strategy);
+      bg::model::polygon<bg::model::d2::point_xy<double>>>
+    eroded_multi;
+    bg::buffer(
+      concave_polygons[largest_polygon_idx], eroded_multi,
+      erosion_distance, side_strategy, join_strategy, end_strategy,
+      point_strategy);
 
     if (!eroded_multi.empty()) {
       eroded_concave_polygon_ = eroded_multi[0];
-      RCLCPP_INFO(this->get_logger(), "[MAIN] Successfully eroded largest "
-                                      "concave polygon for subgoal projection");
+      RCLCPP_INFO(
+        this->get_logger(), "[MAIN] Successfully eroded largest "
+        "concave polygon for subgoal projection");
     } else {
       eroded_concave_polygon_ = concave_polygons[largest_polygon_idx];
       RCLCPP_WARN(
-          this->get_logger(),
-          "[MAIN] Erosion failed, using original largest concave polygon");
+        this->get_logger(),
+        "[MAIN] Erosion failed, using original largest concave polygon");
     }
 
     // Publish concave polygon markers for visualization (all polygons)
-    RCLCPP_INFO(this->get_logger(),
-                "[MAIN] Publishing visualization markers...");
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[MAIN] Publishing visualization markers...");
     publish_multiple_concave_markers(concave_polygons);
 
     // Create envelope from all concave polygons
-    RCLCPP_INFO(this->get_logger(),
-                "[MAIN] Creating envelope from all polygons...");
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[MAIN] Creating envelope from all polygons...");
     bg::model::box<bg::model::d2::point_xy<double>> envelope_box;
     bool first_polygon = true;
     for (size_t i = 0; i < concave_polygons.size(); ++i) {
-      const auto &polygon = concave_polygons[i];
+      const auto & polygon = concave_polygons[i];
       bg::model::box<bg::model::d2::point_xy<double>> poly_box;
       bg::envelope(polygon, poly_box);
 
@@ -1772,23 +1840,24 @@ private:
         envelope_box = poly_box;
         first_polygon = false;
         RCLCPP_INFO(
-            this->get_logger(),
-            "[MAIN] Initial envelope: min(%.2f,%.2f) max(%.2f,%.2f)",
-            poly_box.min_corner().get<0>(), poly_box.min_corner().get<1>(),
-            poly_box.max_corner().get<0>(), poly_box.max_corner().get<1>());
+          this->get_logger(),
+          "[MAIN] Initial envelope: min(%.2f,%.2f) max(%.2f,%.2f)",
+          poly_box.min_corner().get<0>(), poly_box.min_corner().get<1>(),
+          poly_box.max_corner().get<0>(), poly_box.max_corner().get<1>());
       } else {
         // Expand envelope to include this polygon
         bg::expand(envelope_box, poly_box);
-        RCLCPP_INFO(this->get_logger(),
-                    "[MAIN] Expanded envelope for polygon %zu", i);
+        RCLCPP_INFO(
+          this->get_logger(),
+          "[MAIN] Expanded envelope for polygon %zu", i);
       }
     }
 
     RCLCPP_INFO(
-        this->get_logger(),
-        "[MAIN] Final envelope: min(%.2f,%.2f) max(%.2f,%.2f)",
-        envelope_box.min_corner().get<0>(), envelope_box.min_corner().get<1>(),
-        envelope_box.max_corner().get<0>(), envelope_box.max_corner().get<1>());
+      this->get_logger(),
+      "[MAIN] Final envelope: min(%.2f,%.2f) max(%.2f,%.2f)",
+      envelope_box.min_corner().get<0>(), envelope_box.min_corner().get<1>(),
+      envelope_box.max_corner().get<0>(), envelope_box.max_corner().get<1>());
 
     // Publish envelope polygon
     geometry_msgs::msg::Polygon envelope_msg;
@@ -1813,134 +1882,152 @@ private:
 
     // Create obstacle polygons by subtracting ALL concave polygons from
     // envelope
-    RCLCPP_INFO(this->get_logger(),
-                "[MAIN] Creating obstacle polygons by subtracting concave "
-                "polygons from envelope...");
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[MAIN] Creating obstacle polygons by subtracting concave "
+      "polygons from envelope...");
     bg::model::multi_polygon<
-        bg::model::polygon<bg::model::d2::point_xy<double>>>
-        obstacle_polygons;
+      bg::model::polygon<bg::model::d2::point_xy<double>>>
+    obstacle_polygons;
 
     // Start with the envelope box, eroded by robot radius
     bg::model::multi_polygon<
-        bg::model::polygon<bg::model::d2::point_xy<double>>>
-        current_obstacles;
+      bg::model::polygon<bg::model::d2::point_xy<double>>>
+    current_obstacles;
     bg::model::polygon<bg::model::d2::point_xy<double>> envelope_polygon;
     bg::append(
-        envelope_polygon.outer(),
-        bg::model::d2::point_xy<double>(envelope_box.min_corner().get<0>(),
-                                        envelope_box.min_corner().get<1>()));
+      envelope_polygon.outer(),
+      bg::model::d2::point_xy<double>(
+        envelope_box.min_corner().get<0>(),
+        envelope_box.min_corner().get<1>()));
     bg::append(
-        envelope_polygon.outer(),
-        bg::model::d2::point_xy<double>(envelope_box.max_corner().get<0>(),
-                                        envelope_box.min_corner().get<1>()));
+      envelope_polygon.outer(),
+      bg::model::d2::point_xy<double>(
+        envelope_box.max_corner().get<0>(),
+        envelope_box.min_corner().get<1>()));
     bg::append(
-        envelope_polygon.outer(),
-        bg::model::d2::point_xy<double>(envelope_box.max_corner().get<0>(),
-                                        envelope_box.max_corner().get<1>()));
+      envelope_polygon.outer(),
+      bg::model::d2::point_xy<double>(
+        envelope_box.max_corner().get<0>(),
+        envelope_box.max_corner().get<1>()));
     bg::append(
-        envelope_polygon.outer(),
-        bg::model::d2::point_xy<double>(envelope_box.min_corner().get<0>(),
-                                        envelope_box.max_corner().get<1>()));
+      envelope_polygon.outer(),
+      bg::model::d2::point_xy<double>(
+        envelope_box.min_corner().get<0>(),
+        envelope_box.max_corner().get<1>()));
     bg::correct(envelope_polygon);
 
     // Erode the envelope polygon by robot radius
     bg::strategy::buffer::distance_symmetric<double> envelope_erosion_distance(
-        -robot_radius_);
+      -robot_radius_);
     bg::strategy::buffer::join_round envelope_join_strategy;
     bg::strategy::buffer::end_round envelope_end_strategy;
     bg::strategy::buffer::point_circle envelope_point_strategy;
     bg::strategy::buffer::side_straight envelope_side_strategy;
 
     bg::model::multi_polygon<
-        bg::model::polygon<bg::model::d2::point_xy<double>>>
-        eroded_envelope_multi;
-    bg::buffer(envelope_polygon, eroded_envelope_multi,
-               envelope_erosion_distance, envelope_side_strategy, 
-               envelope_join_strategy, envelope_end_strategy,
-               envelope_point_strategy);
+      bg::model::polygon<bg::model::d2::point_xy<double>>>
+    eroded_envelope_multi;
+    bg::buffer(
+      envelope_polygon, eroded_envelope_multi,
+      envelope_erosion_distance, envelope_side_strategy,
+      envelope_join_strategy, envelope_end_strategy,
+      envelope_point_strategy);
 
     if (!eroded_envelope_multi.empty()) {
       current_obstacles.push_back(eroded_envelope_multi[0]);
-      RCLCPP_INFO(this->get_logger(),
-                  "[MAIN] Successfully eroded envelope polygon by robot radius: %f",
-                  robot_radius_);
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[MAIN] Successfully eroded envelope polygon by robot radius: %f",
+        robot_radius_);
     } else {
       current_obstacles.push_back(envelope_polygon);
       RCLCPP_WARN(
-          this->get_logger(),
-          "[MAIN] Envelope erosion failed, using original envelope polygon");
+        this->get_logger(),
+        "[MAIN] Envelope erosion failed, using original envelope polygon");
     }
-    RCLCPP_INFO(this->get_logger(),
-                "[MAIN] Starting with envelope polygon (%zu obstacle polygons)",
-                current_obstacles.size());
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[MAIN] Starting with envelope polygon (%zu obstacle polygons)",
+      current_obstacles.size());
 
     // Subtract each concave polygon from the current obstacle set
     for (size_t i = 0; i < concave_polygons.size(); ++i) {
-      const auto &concave_polygon = concave_polygons[i];
-      RCLCPP_INFO(this->get_logger(),
-                  "[MAIN] Subtracting concave polygon %zu from obstacles...",
-                  i);
+      const auto & concave_polygon = concave_polygons[i];
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[MAIN] Subtracting concave polygon %zu from obstacles...",
+        i);
 
       bg::model::multi_polygon<
-          bg::model::polygon<bg::model::d2::point_xy<double>>>
-          temp_obstacles;
+        bg::model::polygon<bg::model::d2::point_xy<double>>>
+      temp_obstacles;
       bg::difference(current_obstacles, concave_polygon, temp_obstacles);
 
       RCLCPP_INFO(
-          this->get_logger(),
-          "[MAIN] After subtracting polygon %zu: %zu -> %zu obstacle polygons",
-          i, current_obstacles.size(), temp_obstacles.size());
+        this->get_logger(),
+        "[MAIN] After subtracting polygon %zu: %zu -> %zu obstacle polygons",
+        i, current_obstacles.size(), temp_obstacles.size());
 
       current_obstacles = temp_obstacles;
     }
 
     obstacle_polygons = current_obstacles;
-    RCLCPP_INFO(this->get_logger(), "[MAIN] Final obstacle polygons: %zu",
-                obstacle_polygons.size());
+    RCLCPP_INFO(
+      this->get_logger(), "[MAIN] Final obstacle polygons: %zu",
+      obstacle_polygons.size());
 
     // Publish obstacle polygons
-    RCLCPP_INFO(this->get_logger(),
-                "[MAIN] Publishing %zu obstacle polygons...",
-                obstacle_polygons.size());
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[MAIN] Publishing %zu obstacle polygons...",
+      obstacle_polygons.size());
     safe_bayesian_optimization::msg::PolygonArray polygon_array_msg;
     for (size_t i = 0; i < obstacle_polygons.size(); ++i) {
-      const auto &polygon = obstacle_polygons[i];
+      const auto & polygon = obstacle_polygons[i];
       geometry_msgs::msg::Polygon msg_polygon;
-      for (const auto &point : polygon.outer()) {
+      for (const auto & point : polygon.outer()) {
         geometry_msgs::msg::Point32 p;
         p.x = point.get<0>();
         p.y = point.get<1>();
         msg_polygon.points.push_back(p);
       }
       polygon_array_msg.polygons.push_back(msg_polygon);
-      RCLCPP_INFO(this->get_logger(),
-                  "[MAIN] Obstacle polygon %zu has %zu points", i,
-                  polygon.outer().size());
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[MAIN] Obstacle polygon %zu has %zu points", i,
+        polygon.outer().size());
     }
     polygons_pub_->publish(polygon_array_msg);
-    RCLCPP_INFO(this->get_logger(),
-                "[MAIN] Successfully published obstacle polygons");
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[MAIN] Successfully published obstacle polygons");
 
     // Publish debug visualization image if enabled
     if (publish_debug_image_ && debug_image_pub_) {
-      RCLCPP_INFO(this->get_logger(),
-                  "[MAIN] Publishing debug visualization image...");
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[MAIN] Publishing debug visualization image...");
       publish_debug_image(obstacle_polygons, all_boundaries);
     }
 
-    RCLCPP_INFO(this->get_logger(),
-                "[MAIN] Completed publish_obstacle_polygons()");
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[MAIN] Completed publish_obstacle_polygons()");
   }
 
   void
-  publish_debug_image(const bg::model::multi_polygon<
-                          bg::model::polygon<bg::model::d2::point_xy<double>>>
-                          &obstacle_polygons,
-                      const std::vector<std::array<double, 2>> &safe_hull) {
+  publish_debug_image(
+    const bg::model::multi_polygon<
+      bg::model::polygon<bg::model::d2::point_xy<double>>>
+    & obstacle_polygons,
+    const std::vector<std::array<double, 2>> & safe_hull)
+  {
     // Calculate image bounds from data points
     if (D_.rows() == 0) {
-      RCLCPP_WARN(this->get_logger(),
-                  "No data points available for debug image");
+      RCLCPP_WARN(
+        this->get_logger(),
+        "No data points available for debug image");
       return;
     }
 
@@ -1958,33 +2045,35 @@ private:
 
     // Helper function to convert world coordinates to image coordinates
     auto world_to_image = [&](double world_x, double world_y) -> cv::Point {
-      int img_x =
+        int img_x =
           static_cast<int>((world_x - x_min) / (x_max - x_min) * img_width);
-      int img_y = static_cast<int>((1.0 - (world_y - y_min) / (y_max - y_min)) *
-                                   img_height);
-      return cv::Point(img_x, img_y);
-    };
+        int img_y = static_cast<int>((1.0 - (world_y - y_min) / (y_max - y_min)) *
+          img_height);
+        return cv::Point(img_x, img_y);
+      };
 
     // Draw concave hull of safe set using pre-computed hull
     if (safe_hull.size() > 2) {
       std::vector<cv::Point> hull_img_points;
       hull_img_points.reserve(safe_hull.size()); // Reserve capacity
 
-      for (const auto &point : safe_hull) {
+      for (const auto & point : safe_hull) {
         cv::Point img_point = world_to_image(point[0], point[1]);
         // Only add points within image bounds
         if (img_point.x >= 0 && img_point.x < img_width && img_point.y >= 0 &&
-            img_point.y < img_height) {
+          img_point.y < img_height)
+        {
           hull_img_points.push_back(img_point);
         }
       }
 
       if (hull_img_points.size() > 2) {
-        const cv::Point *pts = hull_img_points.data();
+        const cv::Point * pts = hull_img_points.data();
         int npts = hull_img_points.size();
         cv::fillPoly(debug_img, &pts, &npts, 1, cv::Scalar(0, 150, 0));
-        cv::polylines(debug_img, hull_img_points, true, cv::Scalar(0, 255, 0),
-                      2);
+        cv::polylines(
+          debug_img, hull_img_points, true, cv::Scalar(0, 255, 0),
+          2);
       }
     }
 
@@ -1994,50 +2083,53 @@ private:
       if (S_(i)) {
         cv::Point img_point = world_to_image(D_(i, 0), D_(i, 1));
         if (img_point.x >= 0 && img_point.x < img_width && img_point.y >= 0 &&
-            img_point.y < img_height) {
+          img_point.y < img_height)
+        {
           cv::circle(debug_img, img_point, 3, cv::Scalar(255, 0, 0), -1);
         }
       }
     }
 
     // Draw obstacle polygons in blue
-    for (const auto &polygon : obstacle_polygons) {
-      const auto &outer_ring = polygon.outer();
-      if (outer_ring.size() < 3)
+    for (const auto & polygon : obstacle_polygons) {
+      const auto & outer_ring = polygon.outer();
+      if (outer_ring.size() < 3) {
         continue; // Skip invalid polygons
 
+      }
       // Draw outer boundary
       std::vector<cv::Point> cv_points;
       cv_points.reserve(outer_ring.size()); // Reserve capacity
 
-      for (const auto &point : outer_ring) {
+      for (const auto & point : outer_ring) {
         cv::Point img_point = world_to_image(point.get<0>(), point.get<1>());
         cv_points.push_back(img_point);
       }
 
       if (cv_points.size() > 2) {
-        const cv::Point *pts = cv_points.data();
+        const cv::Point * pts = cv_points.data();
         int npts = static_cast<int>(cv_points.size());
         cv::fillPoly(debug_img, &pts, &npts, 1, cv::Scalar(255, 100, 0));
         cv::polylines(debug_img, cv_points, true, cv::Scalar(255, 255, 0), 2);
       }
 
       // Draw holes in obstacle polygons (safe regions inside obstacles) if any
-      for (const auto &inner_ring : polygon.inners()) {
-        if (inner_ring.size() < 3)
+      for (const auto & inner_ring : polygon.inners()) {
+        if (inner_ring.size() < 3) {
           continue;
+        }
 
         std::vector<cv::Point> inner_cv_points;
         inner_cv_points.reserve(inner_ring.size());
 
-        for (const auto &point : inner_ring) {
+        for (const auto & point : inner_ring) {
           cv::Point img_point = world_to_image(point.get<0>(), point.get<1>());
           inner_cv_points.push_back(img_point);
         }
 
         if (inner_cv_points.size() > 2) {
           // Fill holes with green (safe regions inside obstacles)
-          const cv::Point *inner_pts = inner_cv_points.data();
+          const cv::Point * inner_pts = inner_cv_points.data();
           int inner_npts = static_cast<int>(inner_cv_points.size());
           cv::fillPoly(debug_img, &inner_pts, &inner_npts, 1, cv::Scalar(0, 150, 0));
           cv::polylines(debug_img, inner_cv_points, true, cv::Scalar(0, 255, 0), 2);
@@ -2057,12 +2149,15 @@ private:
     // }
 
     // Add legend
-    cv::putText(debug_img, "Safe concave hull (green)", cv::Point(10, 30),
-                cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
-    cv::putText(debug_img, "Obstacles (blue)", cv::Point(10, 55),
-                cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 100, 0), 2);
-    cv::putText(debug_img, "Goal (magenta)", cv::Point(10, 80),
-                cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 0, 255), 2);
+    cv::putText(
+      debug_img, "Safe concave hull (green)", cv::Point(10, 30),
+      cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+    cv::putText(
+      debug_img, "Obstacles (blue)", cv::Point(10, 55),
+      cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 100, 0), 2);
+    cv::putText(
+      debug_img, "Goal (magenta)", cv::Point(10, 80),
+      cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 0, 255), 2);
 
     // Convert OpenCV image to ROS image message
     std_msgs::msg::Header header;
@@ -2070,7 +2165,7 @@ private:
     header.frame_id = "map";
 
     sensor_msgs::msg::Image::SharedPtr img_msg =
-        cv_bridge::CvImage(header, "bgr8", debug_img).toImageMsg();
+      cv_bridge::CvImage(header, "bgr8", debug_img).toImageMsg();
 
     debug_image_pub_->publish(*img_msg);
 
@@ -2078,7 +2173,8 @@ private:
   }
 
   void
-  goal_point_callback(const geometry_msgs::msg::PointStamped::SharedPtr msg) {
+  goal_point_callback(const geometry_msgs::msg::PointStamped::SharedPtr msg)
+  {
     // Check if the goal actually changed (ignore re-publishes of the same goal)
     const double dx = msg->point.x - current_goal_.point.x;
     const double dy = msg->point.y - current_goal_.point.y;
@@ -2087,15 +2183,17 @@ private:
     current_goal_.point = msg->point;
     goal_received_ = true;
 
-    RCLCPP_INFO(this->get_logger(),
-                "New goal received: (%.2f, %.2f), requesting terrain map update",
-                msg->point.x, msg->point.y);
+    RCLCPP_INFO(
+      this->get_logger(),
+      "New goal received: (%.2f, %.2f), requesting terrain map update",
+      msg->point.x, msg->point.y);
 
     // Request terrain map to recompute subgoal with new goal
     request_terrain_map();
   }
 
-  void publish_subgoal_marker(const geometry_msgs::msg::Point &subgoal) {
+  void publish_subgoal_marker(const geometry_msgs::msg::Point & subgoal)
+  {
     visualization_msgs::msg::Marker marker;
     marker.header.frame_id = "map";
     marker.header.stamp = this->get_clock()->now();
@@ -2122,8 +2220,9 @@ private:
   }
 
   void publish_concave_markers(
-      const bg::model::polygon<bg::model::d2::point_xy<double>>
-          &concave_polygon) {
+    const bg::model::polygon<bg::model::d2::point_xy<double>>
+    & concave_polygon)
+  {
     auto marker_array = visualization_msgs::msg::MarkerArray();
 
     int marker_id = 0;
@@ -2145,7 +2244,7 @@ private:
     outer_marker.color.a = 0.8;
 
     // Convert concave polygon outer boundary points to marker points
-    for (const auto &boost_point : concave_polygon.outer()) {
+    for (const auto & boost_point : concave_polygon.outer()) {
       geometry_msgs::msg::Point point;
       point.x = boost_point.get<0>();
       point.y = boost_point.get<1>();
@@ -2162,7 +2261,7 @@ private:
 
     // Create markers for holes (unsafe regions inside)
     for (size_t hole_idx = 0; hole_idx < concave_polygon.inners().size(); ++hole_idx) {
-      const auto &hole = concave_polygon.inners()[hole_idx];
+      const auto & hole = concave_polygon.inners()[hole_idx];
 
       auto hole_marker = visualization_msgs::msg::Marker();
       hole_marker.header.frame_id = "map";
@@ -2180,7 +2279,7 @@ private:
       hole_marker.color.a = 0.8;
 
       // Convert hole points to marker points
-      for (const auto &boost_point : hole) {
+      for (const auto & boost_point : hole) {
         geometry_msgs::msg::Point point;
         point.x = boost_point.get<0>();
         point.y = boost_point.get<1>();
@@ -2200,26 +2299,27 @@ private:
   }
 
   void publish_multiple_concave_markers(
-      const std::vector<bg::model::polygon<bg::model::d2::point_xy<double>>>
-          &concave_polygons) {
+    const std::vector<bg::model::polygon<bg::model::d2::point_xy<double>>>
+    & concave_polygons)
+  {
     auto marker_array = visualization_msgs::msg::MarkerArray();
 
     // Color palette for different polygons
     std::vector<std::array<float, 3>> colors = {
-        {0.0, 0.0, 1.0}, // Blue
-        {0.0, 1.0, 0.0}, // Green
-        {1.0, 0.0, 0.0}, // Red
-        {1.0, 1.0, 0.0}, // Yellow
-        {1.0, 0.0, 1.0}, // Magenta
-        {0.0, 1.0, 1.0}, // Cyan
-        {0.5, 0.0, 0.5}, // Purple
-        {1.0, 0.5, 0.0}  // Orange
+      {0.0, 0.0, 1.0},   // Blue
+      {0.0, 1.0, 0.0},   // Green
+      {1.0, 0.0, 0.0},   // Red
+      {1.0, 1.0, 0.0},   // Yellow
+      {1.0, 0.0, 1.0},   // Magenta
+      {0.0, 1.0, 1.0},   // Cyan
+      {0.5, 0.0, 0.5},   // Purple
+      {1.0, 0.5, 0.0}    // Orange
     };
 
     int marker_id = 0;
 
     for (size_t i = 0; i < concave_polygons.size(); ++i) {
-      const auto &concave_polygon = concave_polygons[i];
+      const auto & concave_polygon = concave_polygons[i];
 
       // Draw outer boundary (safe region boundary)
       auto outer_marker = visualization_msgs::msg::Marker();
@@ -2232,14 +2332,14 @@ private:
 
       // Set marker properties
       outer_marker.scale.x = 0.06; // Line width
-      auto &color = colors[i % colors.size()];
+      auto & color = colors[i % colors.size()];
       outer_marker.color.r = color[0];
       outer_marker.color.g = color[1];
       outer_marker.color.b = color[2];
       outer_marker.color.a = 0.8;
 
       // Convert concave polygon outer boundary points to marker points
-      for (const auto &boost_point : concave_polygon.outer()) {
+      for (const auto & boost_point : concave_polygon.outer()) {
         geometry_msgs::msg::Point point;
         point.x = boost_point.get<0>();
         point.y = boost_point.get<1>();
@@ -2256,7 +2356,7 @@ private:
 
       // Draw holes (unsafe regions inside safe region)
       for (size_t hole_idx = 0; hole_idx < concave_polygon.inners().size(); ++hole_idx) {
-        const auto &hole = concave_polygon.inners()[hole_idx];
+        const auto & hole = concave_polygon.inners()[hole_idx];
 
         auto hole_marker = visualization_msgs::msg::Marker();
         hole_marker.header.frame_id = "map";
@@ -2274,7 +2374,7 @@ private:
         hole_marker.color.a = 0.8;
 
         // Convert hole points to marker points
-        for (const auto &boost_point : hole) {
+        for (const auto & boost_point : hole) {
           geometry_msgs::msg::Point point;
           point.x = boost_point.get<0>();
           point.y = boost_point.get<1>();
@@ -2295,9 +2395,11 @@ private:
   }
 
   void
-  publish_projected_goal_marker(const geometry_msgs::msg::Point &original_goal,
-                                const geometry_msgs::msg::Point &projected_goal,
-                                double projection_distance) {
+  publish_projected_goal_marker(
+    const geometry_msgs::msg::Point & original_goal,
+    const geometry_msgs::msg::Point & projected_goal,
+    double projection_distance)
+  {
     visualization_msgs::msg::Marker line_marker;
     line_marker.header.frame_id = "map";
     line_marker.header.stamp = this->get_clock()->now();
@@ -2344,12 +2446,13 @@ private:
   }
 
   // Helper function to map value to color (yellow = high, green = low)
-  void value_to_color(double normalized_value, float &r, float &g, float &b) {
+  void value_to_color(double normalized_value, float & r, float & g, float & b)
+  {
     // Normalized value should be in [0, 1]
     // Black (low, value=0.0) -> White (high, value=1.0)
     // Clamp to [0, 1]
-    normalized_value = std::clamp(normalized_value, 0.0, 1.0);
-    
+    normalized_value = std::max(0.0, std::min(normalized_value, 1.0));
+
     // Linear interpolation: black (0,0,0) to white (1,1,1)
     r = normalized_value;      // Red: 0.0 at low, 1.0 at high
     g = normalized_value;       // Green: 0.0 at low, 1.0 at high
@@ -2357,22 +2460,23 @@ private:
   }
 
   void publish_frontier_goal_score_markers(
-      const std::vector<CandidateScore> &candidates,
-      const Eigen::MatrixXd &frontier_points) {
+    const std::vector<CandidateScore> & candidates,
+    const Eigen::MatrixXd & frontier_points)
+  {
     visualization_msgs::msg::MarkerArray marker_array;
 
     // Find min/max goal_score for normalization
     double min_val = std::numeric_limits<double>::max();
     double max_val = std::numeric_limits<double>::lowest();
-    for (const auto &candidate : candidates) {
-      if (candidate.goal_score < min_val) min_val = candidate.goal_score;
-      if (candidate.goal_score > max_val) max_val = candidate.goal_score;
+    for (const auto & candidate : candidates) {
+      if (candidate.goal_score < min_val) {min_val = candidate.goal_score;}
+      if (candidate.goal_score > max_val) {max_val = candidate.goal_score;}
     }
     double range = std::max(max_val - min_val, 1e-9);
 
     int marker_id = 0;
     for (size_t i = 0; i < candidates.size(); ++i) {
-      const auto &candidate = candidates[i];
+      const auto & candidate = candidates[i];
       double normalized = (candidate.goal_score - min_val) / range;
       const int frontier_idx = candidate.frontier_idx;
       if (frontier_idx < 0 || frontier_idx >= frontier_points.rows()) {
@@ -2406,22 +2510,23 @@ private:
   }
 
   void publish_frontier_expansion_prob_markers(
-      const std::vector<CandidateScore> &candidates,
-      const Eigen::MatrixXd &frontier_points) {
+    const std::vector<CandidateScore> & candidates,
+    const Eigen::MatrixXd & frontier_points)
+  {
     visualization_msgs::msg::MarkerArray marker_array;
 
     // Find min/max prob_expansion for normalization
     double min_val = std::numeric_limits<double>::max();
     double max_val = std::numeric_limits<double>::lowest();
-    for (const auto &candidate : candidates) {
-      if (candidate.prob_expansion < min_val) min_val = candidate.prob_expansion;
-      if (candidate.prob_expansion > max_val) max_val = candidate.prob_expansion;
+    for (const auto & candidate : candidates) {
+      if (candidate.prob_expansion < min_val) {min_val = candidate.prob_expansion;}
+      if (candidate.prob_expansion > max_val) {max_val = candidate.prob_expansion;}
     }
     double range = std::max(max_val - min_val, 1e-9);
 
     int marker_id = 0;
     for (size_t i = 0; i < candidates.size(); ++i) {
-      const auto &candidate = candidates[i];
+      const auto & candidate = candidates[i];
       double normalized = (candidate.prob_expansion - min_val) / range;
       const int frontier_idx = candidate.frontier_idx;
       if (frontier_idx < 0 || frontier_idx >= frontier_points.rows()) {
@@ -2455,9 +2560,10 @@ private:
   }
 
   void publish_frontier_goal_distance_markers(
-      const Eigen::VectorXd &goal_distances,
-      const Eigen::MatrixXd &frontier_points,
-      bool has_goal) {
+    const Eigen::VectorXd & goal_distances,
+    const Eigen::MatrixXd & frontier_points,
+    bool has_goal)
+  {
     visualization_msgs::msg::MarkerArray marker_array;
 
     if (!has_goal || goal_distances.size() == 0) {
@@ -2499,8 +2605,9 @@ private:
       marker.scale.z = 0.1;
 
       // Closer to goal -> brighter marker.
-      value_to_color(normalized_closeness, marker.color.r, marker.color.g,
-                     marker.color.b);
+      value_to_color(
+        normalized_closeness, marker.color.r, marker.color.g,
+        marker.color.b);
       marker.color.a = 1.0;
 
       marker_array.markers.push_back(marker);
@@ -2510,8 +2617,9 @@ private:
   }
 
   void publish_frontier_robot_distance_markers(
-      const Eigen::VectorXd &robot_distances,
-      const Eigen::MatrixXd &frontier_points) {
+    const Eigen::VectorXd & robot_distances,
+    const Eigen::MatrixXd & frontier_points)
+  {
     visualization_msgs::msg::MarkerArray marker_array;
 
     if (robot_distances.size() == 0) {
@@ -2546,8 +2654,9 @@ private:
       marker.scale.z = 0.1;
 
       // Closer to robot -> brighter marker.
-      value_to_color(normalized_closeness, marker.color.r, marker.color.g,
-                     marker.color.b);
+      value_to_color(
+        normalized_closeness, marker.color.r, marker.color.g,
+        marker.color.b);
       marker.color.a = 1.0;
 
       marker_array.markers.push_back(marker);
@@ -2557,14 +2666,15 @@ private:
   }
 
   void publish_frontier_overall_score_markers(
-      const std::vector<CandidateScore> &candidates,
-      const Eigen::MatrixXd &frontier_points) {
+    const std::vector<CandidateScore> & candidates,
+    const Eigen::MatrixXd & frontier_points)
+  {
     visualization_msgs::msg::MarkerArray marker_array;
 
     // Compute overall_score = prob_expansion * goal_score
     std::vector<double> overall_scores;
     overall_scores.reserve(candidates.size());
-    for (const auto &candidate : candidates) {
+    for (const auto & candidate : candidates) {
       overall_scores.push_back(candidate.prob_expansion * candidate.goal_score);
     }
 
@@ -2575,7 +2685,7 @@ private:
 
     int marker_id = 0;
     for (size_t i = 0; i < candidates.size(); ++i) {
-      const auto &candidate = candidates[i];
+      const auto & candidate = candidates[i];
       double normalized = (overall_scores[i] - min_val) / range;
       const int frontier_idx = candidate.frontier_idx;
       if (frontier_idx < 0 || frontier_idx >= frontier_points.rows()) {
@@ -2609,7 +2719,8 @@ private:
   }
 };
 
-int main(int argc, char *argv[]) {
+int main(int argc, char * argv[])
+{
   rclcpp::init(argc, argv);
   auto node = std::make_shared<OptimizerNode>();
   rclcpp::executors::SingleThreadedExecutor executor;
