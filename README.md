@@ -1,38 +1,37 @@
 # Safe Bayesian Optimization
 
-ROS 2 package for safe subgoal selection and reactive navigation using Bayesian optimization, terrain uncertainty, and polygon-based obstacle avoidance.
+`safe_bayesian_optimization` is a ROS 2 package for safe subgoal selection and reactive navigation. It combines Bayesian optimization, terrain uncertainty, and polygon-based obstacle avoidance to help a scouting robot move toward useful goals while staying in safe regions.
 
-## What It Does
+## Overview
 
-This package builds a safe navigation loop for scouting robots:
+The navigation loop is:
 
-1. Requests terrain and uncertainty maps from the mapping stack.
-2. Computes safe and informative candidate subgoals with Bayesian optimization.
-3. Converts unsafe terrain into polygonal obstacles and safe-region boundaries.
-4. Publishes subgoals to a reactive planner.
-5. Drives a simulated robot with diffeomorphism-based obstacle avoidance.
-6. Publishes markers and optional debug images for Foxglove/RViz-style visualization.
+1. Request a terrain map with uncertainty from the mapping stack.
+2. Score candidate subgoals for safety, goal progress, frontier value, and expansion value.
+3. Convert unsafe terrain into polygonal obstacles and safe-region boundaries.
+4. Publish the selected safe subgoal.
+5. Track the subgoal with a reactive planner.
+6. Publish visualization markers for Foxglove or RViz-style debugging.
 
-## Main Components
+## Package Contents
 
-| Executable | Purpose |
+| Executable | Description |
 | --- | --- |
-| `safe_bayesian_optimization_node` | Computes safe subgoals from terrain data, uncertainty, and goal preferences. |
+| `safe_bayesian_optimization_node` | Selects safe, informative subgoals from terrain and uncertainty data. |
 | `reactive_navigation_node` | Tracks subgoals while avoiding polygonal obstacles. |
-| `goal_point_publisher` | Publishes test or user-selected goal points. |
-| `turtlesim_spatial_publisher.py` | Publishes simulated spatial data for turtlesim-based testing. |
-| `evaluation_node.py` | Helper script for evaluation workflows. |
+| `goal_point_publisher` | Publishes configured, user-provided, or exploration goals. |
+| `turtlesim_spatial_publisher.py` | Publishes simple simulated spatial updates for local testing. |
+| `evaluation_node.py` | Helper node for evaluation workflows. |
 
-## Features
+## Highlights
 
-- Bayesian optimization for safe and informative subgoal selection
-- Terrain uncertainty-aware safety constraints
-- Goal, frontier, and expansion scoring for subgoal ranking
-- Diffeomorphism-based reactive navigation around polygonal obstacles
-- Concave hull / alpha-shape safe-region processing with CGAL
-- Voronoi/free-space support through the reactive planner geometry library
-- ROS 2-native topics, services, messages, launch files, and parameters
-- Foxglove-compatible visualization markers and optional debug images
+- Safe Bayesian optimization over uncertain terrain
+- Goal, frontier, and expansion-based subgoal scoring
+- `max` and `alternating_preference` subgoal selection strategies
+- Diffeomorphism-based reactive navigation around polygon obstacles
+- Optional naive proportional-control mode for debugging
+- CGAL-based safe-region and polygon processing
+- ROS-native launch files, parameters, messages, services, and visualization topics
 
 ## Requirements
 
@@ -40,38 +39,32 @@ This package builds a safe navigation loop for scouting robots:
 
 - ROS 2 Humble
 - `ament_cmake`
-- C++14-compatible compiler
 - CMake 3.8+
+- C++14-compatible compiler
 
-### ROS Packages
+### Package Dependencies
 
-Core package dependencies include:
+Core ROS dependencies:
 
 - `rclcpp`, `rclpy`
-- `geometry_msgs`, `sensor_msgs`, `nav_msgs`, `visualization_msgs`
+- `geometry_msgs`, `sensor_msgs`, `nav_msgs`, `visualization_msgs`, `std_msgs`, `std_srvs`
 - `tf2`, `tf2_ros`, `tf2_geometry_msgs`
-- `cv_bridge`
-- `turtlesim`
+- `cv_bridge`, `turtlesim`
 - `trusses_custom_interfaces`
+- `safe_scout_simulator`
 
-The full demo launch also expects external packages such as:
+System/library dependencies:
+
+- Eigen3, OpenCV, Boost System, CGAL Core, Qhull
+- Qt5 Core/Widgets, libcurl, PCL development libraries
+- Python: `numpy`, `shapely`
+
+The full mapping demo also expects:
 
 - `mapping_package`
 - `mapping_collector`
 - `foxglove_visualization`
 - `foxglove_bridge`
-
-### System Libraries
-
-- Eigen3
-- OpenCV
-- Boost
-- CGAL
-- Qhull
-- Qt5 Core/Widgets
-- libcurl
-- PCL development libraries
-- Python packages: `numpy`, `shapely`
 
 ## Build
 
@@ -82,7 +75,7 @@ colcon build --packages-select safe_bayesian_optimization --cmake-args -DBUILD_E
 source install/setup.bash
 ```
 
-Or build the full workspace:
+To build the full workspace instead:
 
 ```bash
 colcon build --cmake-args -DBUILD_EXAMPLES=OFF
@@ -102,19 +95,13 @@ This includes the subgoal preference characterization test.
 
 ## Run
 
-### Turtlesim / local scouting demo
+### Local scouting demo
 
 ```bash
 ros2 launch safe_bayesian_optimization safe_scout.launch.py
 ```
 
-This launches:
-
-- safe Bayesian optimization node
-- goal point publisher
-- reactive navigation node
-- turtlesim
-- turtlesim spatial publisher
+Launches the optimizer, goal publisher, reactive planner, turtlesim, and local spatial-data publisher.
 
 ### Full mapping and visualization demo
 
@@ -122,9 +109,9 @@ This launches:
 ros2 launch safe_bayesian_optimization safe_bayesian_optimization.launch.py
 ```
 
-This includes the local demo nodes plus mapping, data collection, Foxglove visualization, and Foxglove bridge nodes.
+Launches the local demo plus mapping, data collection, Foxglove visualization, and Foxglove bridge nodes.
 
-### Override config paths
+### Custom config files
 
 ```bash
 ros2 launch safe_bayesian_optimization safe_scout.launch.py \
@@ -134,115 +121,108 @@ ros2 launch safe_bayesian_optimization safe_scout.launch.py \
 
 ## Configuration
 
-Configuration files are in [`config/`](config/).
+Runtime configs live in [`config/`](config/).
 
-### `config/safe_bayesian_optimization.yaml`
+### Optimizer config
 
-Key parameter groups:
+File: [`config/safe_bayesian_optimization.yaml`](config/safe_bayesian_optimization.yaml)
 
-- `opt.beta`: exploration weight for Bayesian optimization
-- `opt.lipshitz`: Lipschitz safety parameter
-- `opt.f_max`: maximum accepted terrain/function value
-- `opt.subgoal_erosion`: erosion margin for safe subgoal generation
-- `opt.preference_order`: ordered scoring preferences, e.g. goal/frontier/expansion
-- `opt.update_on_measurement`: update safe region on new measurements vs. on subgoal completion
-- `opt.selection_strategy`: subgoal selection mode, e.g. `max` or `alternating_preference`
-- `terrain_map.*`: map dimensions and resolution
-- `debug.publish_debug_image`: enable/disable debug image publishing
-- `robot.pose_topic`: robot pose topic used by the optimizer
-- `node.update_rate`: optimizer update rate in Hz
-- `visualization.topic_whitelist`: marker topics for visualization tooling
+| Parameter | Description |
+| --- | --- |
+| `opt.beta` | Bayesian optimization exploration weight. |
+| `opt.lipschitz` | Lipschitz safety parameter. |
+| `opt.f_max` | Maximum accepted terrain/function value. |
+| `opt.subgoal_erosion` | Safety erosion margin for subgoal generation. |
+| `opt.preference_order` | Ordered scoring preferences, e.g. `g`, `l`, `e`. |
+| `opt.selection_strategy` | Selection mode: `max` or `alternating_preference`. |
+| `opt.update_on_measurement` | Update safe region on new measurements instead of only after subgoal completion. |
+| `opt.expansion_score_k` | Expansion-score decay parameter. |
+| `opt.goal_score_k` | Goal-distance score decay parameter. |
+| `terrain_map.*` | Map dimensions, cell counts, and/or resolution for map requests. |
+| `robot.pose_topic` | Robot pose topic used by the optimizer. |
+| `debug.publish_debug_image` | Enables `/debug_polygons_image`. |
+| `visualization.topic_whitelist` | Marker topics for visualization tooling. |
 
-### `config/reactive_planner.yaml`
+> Note: the node declares `opt.lipschitz`; older configs may contain the misspelled key `opt.lipshitz`.
 
-Key parameters:
+### Reactive planner config
 
-- `p`: R-function exponent
-- `epsilon`: switch distance
-- `varepsilon`: polygon dilation allowance
-- `mu_1`, `mu_2`: switch scaling exponents
-- `robot_radius`: collision radius in meters
-- `linear_gain`, `angular_gain`: controller gains
-- `linear_cmd_limit`, `angular_cmd_limit`: velocity limits
-- `goal_tolerance`: stopping tolerance near the current subgoal
-- `next_subgoal_tolerance`: distance threshold for subgoal completion
-- `naive_mode`: bypass diffeomorphism and use direct proportional control
+File: [`config/reactive_planner.yaml`](config/reactive_planner.yaml)
 
-### `config/lpsc.yaml`
+| Parameter | Description |
+| --- | --- |
+| `p` | R-function exponent. |
+| `epsilon` | Switch distance. |
+| `varepsilon` | Polygon dilation allowance. |
+| `mu_1`, `mu_2` | Switch scaling exponents. |
+| `robot_radius` | Collision radius in meters. |
+| `linear_gain`, `angular_gain` | Controller gains. |
+| `linear_cmd_limit`, `angular_cmd_limit` | Velocity limits. |
+| `goal_tolerance` | Stop tolerance near the current subgoal. |
+| `next_subgoal_tolerance` | Distance threshold for reporting subgoal completion. |
+| `naive_mode` | Use direct proportional control instead of diffeomorphism-based navigation. |
 
-Parameters for the larger LPSC/mapping demo, including visualization ranges, data collection settings, and terrain mapping parameters.
+### LPSC/mapping config
+
+File: [`config/lpsc.yaml`](config/lpsc.yaml)
+
+Used by the larger mapping demo for visualization ranges, data collection, terrain mapping, and waypoint settings.
 
 ## Interfaces
 
-### Custom Message
+### Custom message
 
 | Message | Description |
 | --- | --- |
 | `safe_bayesian_optimization/PolygonArray` | Array of `geometry_msgs/Polygon` obstacles. |
 
-### Published Topics
+### Core topics
 
-#### `safe_bayesian_optimization_node`
+| Topic | Type | Direction | Description |
+| --- | --- | --- | --- |
+| `/goal_point` | `geometry_msgs/PointStamped` | Goal publisher → optimizer/planner | Current target goal. |
+| `/current_subgoal` | `geometry_msgs/Point` | Optimizer → planner | Selected safe subgoal. |
+| `/polygon_array` | `safe_bayesian_optimization/PolygonArray` | Optimizer → planner | Obstacle polygons from unsafe terrain. |
+| `/envelope_polygon` | `geometry_msgs/Polygon` | Optimizer → planner | Workspace envelope boundary. |
+| `/spirit/current_pose` | `geometry_msgs/Pose` | Robot/sim → nodes | Robot pose. Optimizer topic is configurable with `robot.pose_topic`. |
+| `/spirit/planner_twist_command` | `geometry_msgs/Twist` | Planner → robot/sim | Velocity command. |
+| `/subgoal_reached` | `std_msgs/Empty` | Planner → optimizer | Subgoal completion notification. |
+| `/spatial_data_size` | `std_msgs/Int32` | Spatial publisher → optimizer | Measurement-count update trigger. |
+| `/input_goal_point` | `geometry_msgs/PointStamped` | User/tool → goal publisher | Adds a runtime goal point. |
 
-| Topic | Type | Description |
-| --- | --- | --- |
-| `/current_subgoal` | `geometry_msgs/Point` | Current safe subgoal for the reactive planner. |
-| `/subgoal_marker` | `visualization_msgs/Marker` | Current subgoal visualization. |
-| `/polygon_array` | `safe_bayesian_optimization/PolygonArray` | Obstacle polygons from unsafe terrain. |
-| `/envelope_polygon` | `geometry_msgs/Polygon` | Workspace envelope boundary. |
-| `/concave_markers` | `visualization_msgs/MarkerArray` | Safe-region boundary visualization. |
-| `/debug_polygons_image` | `sensor_msgs/Image` | Optional debug image. |
+### Visualization topics
 
-#### `reactive_navigation_node`
+Common marker topics include:
 
-| Topic | Type | Description |
-| --- | --- | --- |
-| `/turtle1/cmd_vel` | `geometry_msgs/Twist` | Velocity command output. |
-| `/freespace_markers` | `visualization_msgs/MarkerArray` | Local free-space visualization. |
-| `/envelope_markers` | `visualization_msgs/MarkerArray` | Workspace envelope visualization. |
+- `/goal_marker`, `/goal_markers`
+- `/subgoal_marker`, `/projected_goal_marker`
+- `/concave_markers`, `/envelope_markers`
+- `/freespace_markers`, `/local_workspace_markers`
+- `/frontier_goal_score_markers`
+- `/frontier_expansion_prob_markers`
+- `/frontier_overall_score_markers`
+- `/frontier_goal_distance_markers`
+- `/frontier_robot_distance_markers`
+- `/debug_polygons_image` when enabled
 
-#### `goal_point_publisher`
+### Services
 
-| Topic | Type | Description |
-| --- | --- | --- |
-| `/goal_point` | `geometry_msgs/Point` | Test or user goal point. |
-| `/goal_marker` | `visualization_msgs/Marker` | Goal point visualization. |
-
-### Subscribed Topics
-
-#### `safe_bayesian_optimization_node`
-
-| Topic | Type | Description |
-| --- | --- | --- |
-| `/goal_point` | `geometry_msgs/Point` | Target goal for planning. |
-
-#### `reactive_navigation_node`
-
-| Topic | Type | Description |
-| --- | --- | --- |
-| `/polygon_array` | `safe_bayesian_optimization/PolygonArray` | Obstacle polygons. |
-| `/envelope_polygon` | `geometry_msgs/Polygon` | Workspace envelope. |
-| `/turtle1/pose` | `turtlesim/Pose` | Simulated robot pose. |
-| `/current_subgoal` | `geometry_msgs/Point` | Optimizer-selected subgoal. |
-
-### Service Clients
-
-#### `safe_bayesian_optimization_node`
-
-| Service | Type | Description |
-| --- | --- | --- |
-| `get_spatial_data` | `trusses_custom_interfaces/SpatialData` | Requests spatial measurements for terrain analysis. |
-| `get_terrain_map_with_uncertainty` | `trusses_custom_interfaces/GetTerrainMapWithUncertainty` | Requests terrain map and uncertainty estimates. |
+| Node | Service | Type | Description |
+| --- | --- | --- | --- |
+| `safe_bayesian_optimization_node` | `/get_terrain_map_with_uncertainty` | `trusses_custom_interfaces/GetTerrainMapWithUncertainty` | Requests terrain and uncertainty maps. |
+| `goal_point_publisher` | `/increment_goal_index` | `std_srvs/Trigger` | Advances to the next configured waypoint. |
+| `evaluation_node.py` | `/sample_points` | `trusses_custom_interfaces/SamplePoints` | Requests sample points for evaluation. |
 
 ## Repository Layout
 
 ```text
 config/      Runtime parameter YAML files
-include/     Public C++ headers
+include/     Public C++ headers and planner interfaces
 launch/      ROS 2 launch files
 msg/         Custom ROS message definitions
 src/         C++ nodes, planner libraries, and Python helper nodes
 data/        Package data assets
+plans/       Development notes and implementation plans
 ```
 
 ## License
