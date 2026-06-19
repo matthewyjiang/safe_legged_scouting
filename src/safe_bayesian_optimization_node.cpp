@@ -33,6 +33,7 @@
 #include <opencv2/opencv.hpp>
 #include <queue>
 #include <string>
+#include <stdexcept>
 #include <unordered_map>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -96,6 +97,14 @@ public:
     }
     robot_radius_ = this->get_parameter("robot.radius").as_double();
     simplification_tolerance_ = this->get_parameter("polygon.simplification_tolerance").as_double();
+
+    preference_order_ = ParsePreferenceOrder(preference_order_param);
+    preference_index_ = 0;
+    has_terrain_map_ = false;
+    has_robot_pose_ = false;
+    last_subgoal_valid_ = false;
+    new_subgoal_requested_ = true;
+    robot_pose_topic = "spirit/current_pose";
 
     // Create service clients
     terrain_map_client_ = this->create_client<
@@ -258,6 +267,21 @@ private:
   bool confidence_initialized_;
   bool safe_set_initialized_;
 
+  enum class PreferenceMetric {
+    Goal,
+    Last,
+    Expansion,
+  };
+
+  struct CandidateScore {
+    double goal_score;
+    double robot_score;
+    double expansion_score;
+    double prob_expansion;
+    int frontier_idx;
+    int data_index;
+  };
+
   // Disjoint set data structure using map
   class DisjointSet {
   private:
@@ -271,11 +295,17 @@ private:
         rank_[x] = 0;
       }
     }
+  };
 
-  void ComputeSets() {
-    UpdateMonotonicConfidenceIntervals();
-    UpdateSafeSetWithLipschitz();
-  }
+  std::vector<PreferenceMetric> preference_order_;
+  size_t preference_index_;
+  bool has_terrain_map_;
+  bool has_robot_pose_;
+  geometry_msgs::msg::Point current_robot_position_;
+  geometry_msgs::msg::Point last_subgoal_;
+  bool last_subgoal_valid_;
+  bool new_subgoal_requested_;
+  std::string robot_pose_topic;
 
   std::vector<PreferenceMetric> ParsePreferenceOrder(
       const std::vector<std::string> &order) {
@@ -297,59 +327,6 @@ private:
     return metrics;
   }
 
-
-  void InitializeConfidenceBoundsIfNeeded() {
-    if (C_low_.size() == mu_.size()) {
-      return;
-    }
-
-    const double neg_inf = -std::numeric_limits<double>::infinity();
-    const double pos_inf = std::numeric_limits<double>::infinity();
-
-    C_low_.resize(mu_.size());
-    C_high_.resize(mu_.size());
-    C_low_.setConstant(neg_inf);
-    C_high_.setConstant(pos_inf);
-
-    S_.resize(mu_.size());
-    S_.setConstant(false);
-
-    confidence_initialized_ = true;
-    safe_set_initialized_ = false;
-  }
-
-  void UpdateMonotonicConfidenceIntervals() {
-    InitializeConfidenceBoundsIfNeeded();
-
-    const double sqrt_beta = std::sqrt(beta_);
-    const Eigen::VectorXd confidence = sqrt_beta * std_;
-
-    const Eigen::VectorXd Q_low = mu_ - confidence;
-    const Eigen::VectorXd Q_high = mu_ + confidence;
-
-    Q_.col(0) = Q_low;
-    Q_.col(1) = Q_high;
-
-    C_low_ = C_low_.cwiseMax(Q_low);
-    C_high_ = C_high_.cwiseMin(Q_high);
-  }
-
-  void UpdateSafeSetWithLipschitz() {
-    if (S_.rows() == 0 || D_.rows() == 0) {
-      return;
-    }
-
-    if (lipschitz_L_ <= 0.0) {
-      RCLCPP_WARN(this->get_logger(),
-                  "Lipschitz constant <= 0; safe set will not expand.");
-      return;
-    }
-
-    const int n_points = D_.rows();
-    std::vector<char> safe_flags(n_points, 0);
-
-    std::vector<int> anchor_indices;
-    anchor_indices.reserve(n_points);
 
   void ComputeSets() {
     UpdateMonotonicConfidenceIntervals();
@@ -739,7 +716,7 @@ private:
         return -1;
       }
 
-      return frontier_indices[best_index];
+      return candidate_indices[best_index];
     }
 
     const Eigen::VectorXd goal_eigen =
@@ -1001,13 +978,7 @@ private:
       return frontier_indices.front();
     }
 
-    if (best_index < 0) {
-      RCLCPP_WARN(this->get_logger(),
-                  "Failed to select frontier point near goal");
-      return -1;
-    }
-
-    return frontier_indices[best_index];
+    return best->data_index;
   }
 
   void spatial_data_size_callback(const std_msgs::msg::Int32::SharedPtr msg) {
@@ -1093,11 +1064,7 @@ private:
             RCLCPP_INFO(this->get_logger(), "Received terrain map: %s",
                         response->message.c_str());
 
-            // Store grid dimensions for later use
-            terrain_width_cells_ = response->n_width_cells;
-            terrain_height_cells_ = response->n_height_cells;
-
-            // Process the terrain map data here
+                    // Process the terrain map data here
             process_terrain_map(response);
 
           } else {
@@ -1107,17 +1074,53 @@ private:
         });
   }
 
+
+  bool ValidateTerrainMapResponse(
+      const std::shared_ptr<const trusses_custom_interfaces::srv::
+                                GetTerrainMapWithUncertainty::Response>
+          response) const {
+    const size_t x_size = response->x_coords.size();
+    const size_t y_size = response->y_coords.size();
+    const size_t values_size = response->values.size();
+    const size_t uncertainties_size = response->uncertainties.size();
+
+    if (response->n_width_cells < 0 || response->n_height_cells < 0) {
+      RCLCPP_WARN(this->get_logger(),
+                  "Rejecting terrain map with negative dimensions: width=%d, height=%d",
+                  response->n_width_cells, response->n_height_cells);
+      return false;
+    }
+
+    if (x_size != y_size || x_size != values_size ||
+        x_size != uncertainties_size) {
+      RCLCPP_WARN(this->get_logger(),
+                  "Rejecting terrain map with mismatched array sizes: x=%zu, y=%zu, values=%zu, uncertainties=%zu",
+                  x_size, y_size, values_size, uncertainties_size);
+      return false;
+    }
+
+    // The terrain service may return sparse point sets, so do not require
+    // n_width_cells * n_height_cells to equal the point count here.
+    return true;
+  }
+
   void process_terrain_map(
       const std::shared_ptr<const trusses_custom_interfaces::srv::
                                 GetTerrainMapWithUncertainty::Response>
           response) {
     const auto process_start = std::chrono::steady_clock::now();
+
+    if (!ValidateTerrainMapResponse(response)) {
+      return;
+    }
+
+    const size_t num_points = response->x_coords.size();
+    terrain_width_cells_ = response->n_width_cells;
+    terrain_height_cells_ = response->n_height_cells;
     has_terrain_map_ = true;
 
     // Update the parameter set D_, mean mu_, and std_ with the new terrain map
     // data
-    const size_t num_points = response->x_coords.size();
-
     D_.resize(num_points, 2);
     mu_.resize(num_points);
     std_.resize(num_points);
@@ -1133,13 +1136,13 @@ private:
 
     const auto compute_sets_start = std::chrono::steady_clock::now();
     // Recompute sets with new data
-    RCLCPP_INFO(this->get_logger(), 
+    RCLCPP_INFO(this->get_logger(),
                 "Updating safe set with %zu data points (update_on_measurement=%s)",
                 num_points, update_on_measurement_ ? "true" : "false");
     ComputeSets();
     const auto compute_sets_end = std::chrono::steady_clock::now();
     int safe_count = S_.count();
-    RCLCPP_INFO(this->get_logger(), 
+    RCLCPP_INFO(this->get_logger(),
                 "Safe set updated: %d/%zu points are safe", safe_count, num_points);
 
     const auto publish_polygons_start = std::chrono::steady_clock::now();
@@ -1149,131 +1152,76 @@ private:
     const auto subgoal_start = std::chrono::steady_clock::now();
     const bool should_select_subgoal = new_subgoal_requested_ || !last_subgoal_valid_;
     if (should_select_subgoal) {
-      // Check if the goal itself is safe by checking if it's within the eroded
-      // polygon
       bg::model::d2::point_xy<double> goal_point(current_goal_.point.x,
                                                  current_goal_.point.y);
 
       geometry_msgs::msg::Point subgoal;
       if (goal_received_ && bg::within(goal_point, eroded_concave_polygon_)) {
-        // Goal is safe, use it directly as the subgoal
         subgoal.x = current_goal_.point.x;
         subgoal.y = current_goal_.point.y;
         subgoal.z = 0.0;
 
-    // Check if the goal itself is safe by checking if it's within the eroded
-    // polygon
-    bg::model::d2::point_xy<double> goal_point(current_goal_.point.x,
-                                               current_goal_.point.y);
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Goal is within eroded safe region, using goal as subgoal: (%f, %f)",
+            subgoal.x, subgoal.y);
+      } else {
+        if (!goal_received_) {
+          RCLCPP_INFO(this->get_logger(),
+                      "No goal available; selecting frontier with highest uncertainty");
+        }
 
-    geometry_msgs::msg::Point subgoal;
-    if (goal_received_ && bg::within(goal_point, eroded_concave_polygon_)) {
-      // Goal is safe, use it directly as the subgoal
-      subgoal.x = current_goal_.point.x;
-      subgoal.y = current_goal_.point.y;
-      subgoal.z = 0.0;
+        const auto get_subgoal_start = std::chrono::steady_clock::now();
+        const int next_subgoal_index = GetNextSubgoal();
+        const auto get_subgoal_end = std::chrono::steady_clock::now();
+        if (next_subgoal_index < 0) {
+          RCLCPP_WARN(this->get_logger(), "No valid subgoal found");
+          return;
+        }
 
-      RCLCPP_INFO(
-          this->get_logger(),
-          "Goal is within eroded safe region, using goal as subgoal: (%f, %f)",
-          subgoal.x, subgoal.y);
-    } else {
-      if (!goal_received_) {
-        RCLCPP_INFO(this->get_logger(),
-                    "No goal available; selecting frontier with highest uncertainty");
-      }
-      // Goal is not safe, find frontier subgoal and project it
-      const int next_subgoal_index = GetNextSubgoal();
-      if (next_subgoal_index >= 0) {
-        // Get the raw subgoal from the terrain map
-        double raw_x = response->x_coords[next_subgoal_index];
-        double raw_y = response->y_coords[next_subgoal_index];
+        const double raw_x = response->x_coords[next_subgoal_index];
+        const double raw_y = response->y_coords[next_subgoal_index];
 
-        // Convert boost polygon to polygeom_lib polygon format
         polygon eroded_poly_for_projection;
         for (const auto &boost_point : eroded_concave_polygon_.outer()) {
           point polygeom_point(boost_point.get<0>(), boost_point.get<1>());
           eroded_poly_for_projection.outer().push_back(polygeom_point);
         }
-        const auto get_subgoal_start = std::chrono::steady_clock::now();
-        // Goal is not safe, find frontier subgoal and project it
-        const int next_subgoal_index = GetNextSubgoal();
-        const auto get_subgoal_end = std::chrono::steady_clock::now();
-        if (next_subgoal_index >= 0) {
-          // Get the raw subgoal from the terrain map
-          double raw_x = response->x_coords[next_subgoal_index];
-          double raw_y = response->y_coords[next_subgoal_index];
+        bg::correct(eroded_poly_for_projection);
 
-          // Convert boost polygon to polygeom_lib polygon format
-          polygon eroded_poly_for_projection;
-          for (const auto &boost_point : eroded_concave_polygon_.outer()) {
-            point polygeom_point(boost_point.get<0>(), boost_point.get<1>());
-            eroded_poly_for_projection.outer().push_back(polygeom_point);
-          }
+        RCLCPP_INFO(this->get_logger(),
+                    "Next subgoal index: %d, coordinates: (%f, %f)",
+                    next_subgoal_index, raw_x, raw_y);
 
-          bg::correct(eroded_poly_for_projection);
+        point raw_subgoal_point(raw_x, raw_y);
+        const auto project_start = std::chrono::steady_clock::now();
+        ProjectionResultStruct projection_result =
+            polydist(eroded_poly_for_projection, raw_subgoal_point);
+        const auto project_end = std::chrono::steady_clock::now();
 
-          RCLCPP_INFO(this->get_logger(),
-                      "Next subgoal index: %d, coordinates: (%f, %f)",
-                      next_subgoal_index, raw_x, raw_y);
+        subgoal.x = projection_result.projected_point.get<0>();
+        subgoal.y = projection_result.projected_point.get<1>();
+        subgoal.z = 0.0;
 
-          // Create point from raw subgoal coordinates
-          point raw_subgoal_point(raw_x, raw_y);
-
-          // Project the subgoal onto the eroded safe region using polydist
-          const auto project_start = std::chrono::steady_clock::now();
-          ProjectionResultStruct projection_result =
-              polydist(eroded_poly_for_projection, raw_subgoal_point);
-          const auto project_end = std::chrono::steady_clock::now();
-
-          RCLCPP_INFO(this->get_logger(),
-                      "Projected subgoal point: (%f, %f), distance: %f",
-                      projection_result.projected_point.get<0>(),
-                      projection_result.projected_point.get<1>(),
-                      projection_result.dist);
-
-          // Create final subgoal message from projected point
-          subgoal.x = projection_result.projected_point.get<0>();
-          subgoal.y = projection_result.projected_point.get<1>();
-          subgoal.z = 0.0;
-
-          // Publish visualization of the projection when a goal is available
-          if (goal_received_) {
-            const auto marker_start = std::chrono::steady_clock::now();
-            publish_projected_goal_marker(current_goal_.point, subgoal,
-                                          projection_result.dist);
-            const auto marker_end = std::chrono::steady_clock::now();
-            RCLCPP_INFO(this->get_logger(),
-                        "Timing: publish_projected_goal_marker=%ld ms",
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            marker_end - marker_start)
-                            .count());
-          }
-
-          RCLCPP_INFO(this->get_logger(),
-                      "Published projected subgoal: (%f, %f) (distance: %f)",
-                      subgoal.x, subgoal.y, projection_result.dist);
-          RCLCPP_INFO(this->get_logger(),
-                      "Timing: GetNextSubgoal=%ld ms, polydist=%ld ms",
-                      std::chrono::duration_cast<std::chrono::milliseconds>(
-                          get_subgoal_end - get_subgoal_start)
-                          .count(),
-                      std::chrono::duration_cast<std::chrono::milliseconds>(
-                          project_end - project_start)
-                          .count());
-        } else {
-          RCLCPP_WARN(this->get_logger(), "No valid subgoal found");
-          return;
-        }
-      }
-      current_subgoal_pub_->publish(subgoal);
-
-        // Publish visualization of the projection when a goal is available
         if (goal_received_) {
           publish_projected_goal_marker(current_goal_.point, subgoal,
                                         projection_result.dist);
         }
 
+        RCLCPP_INFO(this->get_logger(),
+                    "Published projected subgoal: (%f, %f) (distance: %f)",
+                    subgoal.x, subgoal.y, projection_result.dist);
+        RCLCPP_INFO(this->get_logger(),
+                    "Timing: GetNextSubgoal=%ld ms, polydist=%ld ms",
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        get_subgoal_end - get_subgoal_start)
+                        .count(),
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        project_end - project_start)
+                        .count());
+      }
+
+      current_subgoal_pub_->publish(subgoal);
       last_subgoal_ = subgoal;
       last_subgoal_valid_ = true;
       new_subgoal_requested_ = false;
@@ -2348,7 +2296,7 @@ private:
     // Normalized value should be in [0, 1]
     // Black (low, value=0.0) -> White (high, value=1.0)
     // Clamp to [0, 1]
-    normalized_value = std::clamp(normalized_value, 0.0, 1.0);
+    normalized_value = std::max(0.0, std::min(normalized_value, 1.0));
     
     // Linear interpolation: black (0,0,0) to white (1,1,1)
     r = normalized_value;      // Red: 0.0 at low, 1.0 at high

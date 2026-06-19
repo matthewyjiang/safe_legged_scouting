@@ -14,6 +14,44 @@ struct CandidateScore {
   int data_idx;
 };
 
+struct SelectedCandidate {
+  double strategy_score;
+  double confidence_width;
+  int data_idx;
+};
+
+bool terrain_map_sizes_are_valid(size_t x_size, size_t y_size,
+                                 size_t values_size,
+                                 size_t uncertainties_size, int width,
+                                 int height) {
+  return width >= 0 && height >= 0 && x_size == y_size &&
+         x_size == values_size && x_size == uncertainties_size;
+}
+
+int select_strategy_candidate_data_idx(
+    const std::vector<SelectedCandidate> &candidates) {
+  assert(!candidates.empty());
+
+  int fallback_idx = 0;
+  for (size_t i = 1; i < candidates.size(); ++i) {
+    if (candidates[i].confidence_width >
+        candidates[static_cast<size_t>(fallback_idx)].confidence_width) {
+      fallback_idx = static_cast<int>(i);
+    }
+  }
+
+  const SelectedCandidate *best = nullptr;
+  for (const auto &candidate : candidates) {
+    if (!best || candidate.strategy_score > best->strategy_score) {
+      best = &candidate;
+    }
+  }
+
+  assert(best != nullptr);
+  (void)fallback_idx;
+  return best->data_idx;
+}
+
 std::vector<int> compute_pareto_front(std::vector<CandidateScore> candidates) {
   std::sort(candidates.begin(), candidates.end(),
             [](const CandidateScore &a, const CandidateScore &b) {
@@ -109,6 +147,24 @@ void test_pareto_front_single() {
   assert(pareto.front() == 2);
 }
 
+void test_selected_candidate_return_index() {
+  std::vector<SelectedCandidate> candidates = {
+      {/*strategy_score=*/0.2, /*confidence_width=*/10.0, /*data_idx=*/4},
+      {/*strategy_score=*/0.9, /*confidence_width=*/1.0, /*data_idx=*/7},
+  };
+
+  assert(select_strategy_candidate_data_idx(candidates) == 7);
+}
+
+void test_terrain_map_size_validation() {
+  assert(terrain_map_sizes_are_valid(3, 3, 3, 3, 2, 2));
+  assert(!terrain_map_sizes_are_valid(3, 2, 3, 3, 2, 2));
+  assert(!terrain_map_sizes_are_valid(3, 3, 2, 3, 2, 2));
+  assert(!terrain_map_sizes_are_valid(3, 3, 3, 2, 2, 2));
+  assert(!terrain_map_sizes_are_valid(3, 3, 3, 3, -1, 2));
+  assert(!terrain_map_sizes_are_valid(3, 3, 3, 3, 2, -1));
+}
+
 void test_pareto_front_tradeoff() {
   std::vector<CandidateScore> candidates = {
       {0.9, 0.3, 1.0, 0}, {0.85, 0.1, 3.0, 1},
@@ -124,6 +180,8 @@ int main() {
   test_expansion_score_early_reject();
   test_expansion_score_squared_distance();
   test_pareto_front_single();
+  test_selected_candidate_return_index();
+  test_terrain_map_size_validation();
   test_pareto_front_tradeoff();
   std::cout << "subgoal_preference_test: all tests passed\n";
   return 0;

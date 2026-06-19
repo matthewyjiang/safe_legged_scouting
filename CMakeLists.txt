@@ -163,6 +163,18 @@ install(DIRECTORY
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+  add_executable(subgoal_preference_test src/subgoal_preference_test.cpp)
+  target_link_libraries(subgoal_preference_test Eigen3::Eigen)
+  add_test(NAME subgoal_preference_test COMMAND subgoal_preference_test)
+
+  add_test(
+    NAME launch_package_wiring
+    COMMAND ${Python3_EXECUTABLE} -c
+            "from pathlib import Path; files=['launch/safe_scout.launch.py','launch/safe_bayesian_optimization.launch.py']; bad=[f for f in files if ('safe_' + 'legged_scouting') in Path(f).read_text()]; raise SystemExit('stale package reference: '+','.join(bad) if bad else 0)"
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files
   set(ament_cmake_copyright_FOUND TRUE)
